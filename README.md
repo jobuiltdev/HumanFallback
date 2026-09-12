@@ -9,11 +9,13 @@ taste. HumanFallback detects those tasks, converts them into structured
 **Task Contracts** with explicit acceptance criteria and evidence
 requirements, and delegates them to people through Gibwork bounties.
 
-## Status: Milestone 2
+## Status: Milestone 3
 
-M1 delivered the local foundation; M2 adds the real Gibwork integration
-behind the same adapter boundary. The default backend is still the mock,
-and nothing reaches Gibwork unless you select the `gibwork` adapter.
+M1 delivered the local foundation, M2 the real Gibwork integration, and
+M3 exposes HumanFallback itself as an MCP server so agents can use it
+directly. The default backend is still the mock, and nothing reaches
+Gibwork unless you select the `gibwork` adapter. No path, CLI or MCP,
+moves money without a person approving a quote in a terminal.
 
 | Piece | Where |
 |---|---|
@@ -21,8 +23,10 @@ and nothing reaches Gibwork unless you select the `gibwork` adapter.
 | Human-required task classifier (rule-based) | `src/humanfallback/classifier/` |
 | Contract builder with acceptance criteria and evidence templates | `src/humanfallback/contracts/` |
 | Adapter protocol, mock adapter, real Gibwork adapter | `src/humanfallback/adapters/` |
+| Shared operations layer (rules, locking, one-shot submit) | `src/humanfallback/service.py` |
 | SQLite persistence | `src/humanfallback/store/` |
 | `hf` command-line tool | `src/humanfallback/cli.py` |
+| MCP server for agents | `src/humanfallback/mcp_server.py` |
 
 Not yet: submission approval and rejection, evaluation of returned work,
 a learned classifier.
@@ -132,9 +136,96 @@ call: funding between 1.00 and 100000.00, USDC mint
 `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`, confirmations valid for
 about five minutes.
 
+## Using HumanFallback from an agent (MCP)
+
+`hf mcp serve` runs HumanFallback as an MCP server over stdio. Agents can
+classify requests, build contracts, get a funding quote, and inspect
+bounties and submissions. **They cannot move money.** The server exposes
+no submit, refund, or manual-resolve tool, and the adapter is pinned when
+the server starts; tools take no backend argument.
+
+### Connect to Claude Code
+
+```sh
+# Print the exact commands for this checkout
+uv run hf mcp snippet                     # mock backend (default)
+uv run hf mcp snippet --adapter gibwork   # real backend, explicitly
+
+# Which amounts to:
+claude mcp add humanfallback -- uv --directory /path/to/humanfallback run hf mcp serve
+claude mcp add humanfallback-gibwork -e HF_ADAPTER=gibwork -- \
+    uv --directory /path/to/humanfallback run hf mcp serve
+```
+
+Or in `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "humanfallback": {
+      "command": "uv",
+      "args": ["--directory", "/path/to/humanfallback", "run", "hf", "mcp", "serve"],
+      "env": {}
+    }
+  }
+}
+```
+
+The gibwork variant needs the Gibwork CLI installed with a configured
+profile (see above). At startup the server resolves and prints the
+backend's profile, environment, and wallet to stderr, and refuses to start
+if the profile is unusable.
+
+### Tools
+
+All tools return structured content. Failures are `isError` results with
+`{"error": {"code", "message", "details"}}`, the same envelope the Gibwork
+MCP server uses.
+
+| Tool | Input | Returns | Backend |
+|---|---|---|---|
+| `humanfallback_classify` | `text` | classification + recommended action | none |
+| `humanfallback_contract_create` | `text`, `reward`, `min_submission_amount?`, `title?`, `tags?`, `deadline?`, `force?` | contract view | none |
+| `humanfallback_contract_get` | `contract_id` | contract view | none |
+| `humanfallback_contract_list` | `status?`, `category?`, `limit?` | summaries | none |
+| `humanfallback_contract_refresh` | `contract_id` | contract view with remote snapshot | read |
+| `humanfallback_contract_reconcile` | `contract_id` | outcome + contract view | read |
+| `humanfallback_delegate_prepare` | `contract_id` | quote + ephemeral confirmation | prepare (no funds move) |
+| `humanfallback_submission_list` | `contract_id`, `status?` | submissions | read |
+| `humanfallback_submission_get` | `contract_id`, `submission_id` | one submission | read |
+| `humanfallback_wallet` | — | profile, environment, wallet | read |
+| `humanfallback_status` | — | version, pinned adapter, counts | none |
+
+A contract view carries `locked`, `allowed_actions` (the tools that make
+sense next), and `human_action_required` (what a person has to do, if
+anything). A `submit_uncertain` contract shows `locked: true` and only
+`humanfallback_contract_reconcile` is allowed; `delegate_prepare` is
+refused with `CONTRACT_LOCKED` until the backend confirms the outcome or a
+person runs `hf contract resolve`.
+
+### The approval boundary
+
+`humanfallback_delegate_prepare` returns the exact quote and records a
+`prepared` attempt on the contract. The confirmation it includes is marked
+`ephemeral: true, usable_for_submit: false`: it expires with the call and
+cannot be submitted through MCP or anywhere else. To fund the bounty a
+person runs the command in `human_action_required`:
+
+```sh
+hf delegate <contract_id> --adapter gibwork --confirm
+```
+
+That command prepares a **fresh** quote in its own session, prints it, and
+asks the person to approve it. Nothing an agent obtains over MCP can be
+reused to spend.
+
 ## How it fits together
 
 ```
+CLI (hf)            MCP server (hf mcp serve)
+    \                  /
+     service.py  -- rules, uncertain-submit lock, attempts, one-shot submit
+        |
 request text
   -> classifier      human_required? category, confidence, reasons
   -> builder         TaskContract with acceptance criteria + evidence requirements
@@ -194,7 +285,10 @@ before the server is even asked.
 
 ```
 src/humanfallback/
-  cli.py              typer application
+  cli.py              typer application (presents results, collects approval)
+  mcp_server.py       MCP server for agents (no money-moving tools)
+  service.py          shared operations: rules, locking, attempts, one-shot submit
+  backends.py         adapter construction, pinned per process
   config.py           data directory and backend selection
   models/             pydantic schemas
   classifier/         Classifier protocol + rule-based implementation

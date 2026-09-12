@@ -1,10 +1,11 @@
 [project]
 name = "humanfallback"
-version = "0.2.0"
+version = "0.3.0"
 description = "Agent-to-human delegation layer built around Gibwork."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "mcp>=2.2,<3",
     "pydantic>=2.7",
     "typer>=0.12",
 ]

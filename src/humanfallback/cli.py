@@ -9,48 +9,36 @@
     hf submission <id> <submission-id>
     hf wallet [--adapter ...]
     hf status
+    hf mcp serve [--adapter ...] | hf mcp snippet
 
 Money moves only on `--confirm`, and only after the quote is printed and a
 person approves it. `--yes` skips the interactive prompt but is refused
-unless `--confirm` is also present.
+unless `--confirm` is also present. All rules live in `service.py`; this
+module only presents results and collects approval.
 """
 
 from __future__ import annotations
 
 import json
 import sys
-from collections.abc import Callable
-from datetime import UTC, datetime
-from typing import Annotated, Literal
+from datetime import datetime
+from typing import Annotated
 
 import typer
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from humanfallback import __version__, config
-from humanfallback.adapters import (
-    AdapterError,
-    AmbiguousSubmit,
-    GibworkAdapter,
-    GibworkMcpAdapter,
-    MockGibworkAdapter,
-)
-from humanfallback.classifier import default_classifier
-from humanfallback.contracts import AgentCapableRequest, build_contract
+from humanfallback.adapters import AdapterError, AmbiguousSubmit, GibworkAdapter, MockGibworkAdapter
+from humanfallback.backends import ADAPTER_FACTORIES  # noqa: F401  (patched by tests)
 from humanfallback.models import (
-    DELEGATABLE,
-    REFUNDABLE,
-    AttemptOutcome,
     ContractStatus,
-    DelegationAttempt,
-    DelegationRecord,
     PrepareResult,
-    RefundRecord,
-    RemoteSnapshot,
-    Reward,
+    RemoteSubmission,
     TaskCategory,
     TaskContract,
+    WalletStatus,
 )
-from humanfallback.store import ContractStore
+from humanfallback.service import MoneySession, Service, ServiceError, build_service
 
 EXIT_USAGE = 2
 EXIT_AMBIGUOUS = 22
@@ -60,7 +48,9 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 contract_app = typer.Typer(help="Create and inspect Task Contracts.", no_args_is_help=True)
+mcp_app = typer.Typer(help="Expose HumanFallback to MCP-capable agents.", no_args_is_help=True)
 app.add_typer(contract_app, name="contract")
+app.add_typer(mcp_app, name="mcp")
 
 JsonFlag = Annotated[bool, typer.Option("--json", help="Emit JSON instead of text.")]
 AdapterOpt = Annotated[
@@ -77,62 +67,18 @@ YesFlag = Annotated[
     ),
 ]
 
-
-# -- adapter factories ----------------------------------------------------------
-
-AdapterFactory = Callable[[bool], GibworkAdapter]
+Failure = (ServiceError, AdapterError)
 
 
-def _mock_factory(writes: bool) -> GibworkAdapter:
-    return MockGibworkAdapter(state_path=config.mock_state_path())
+# -- helpers ----------------------------------------------------------------------
 
 
-def _gibwork_factory(writes: bool) -> GibworkAdapter:
-    from humanfallback.adapters.gibwork import resolve_gibwork_command
-
-    return GibworkMcpAdapter(
-        profile=config.gibwork_profile(),
-        environment=config.gibwork_environment(),
-        writes=writes,
-        command=resolve_gibwork_command(config.gibwork_bin()),
-        timeout=config.gibwork_timeout_s(),
-    )
-
-
-ADAPTER_FACTORIES: dict[str, AdapterFactory] = {
-    "mock": _mock_factory,
-    "gibwork": _gibwork_factory,
-}
-
-
-def _adapter(name: str | None, *, writes: bool) -> GibworkAdapter:
-    chosen = (name or config.adapter_name()).lower()
-    factory = ADAPTER_FACTORIES.get(chosen)
-    if factory is None:
-        _fail(f"unknown adapter {chosen!r}; choose one of {', '.join(ADAPTER_FACTORIES)}")
+def _service(adapter: str | None) -> Service:
     try:
-        return factory(writes)
+        return build_service(adapter or config.adapter_name())
     except AdapterError as exc:
-        _fail(str(exc))
+        _fail(exc.message)
     raise AssertionError  # unreachable
-
-
-def _announce(backend: GibworkAdapter) -> None:
-    """Resolve and print the backend identity before anything else happens."""
-    try:
-        status = backend.wallet_status()
-    except AdapterError as exc:
-        _fail(f"could not resolve backend: {exc}")
-    _note(
-        f"backend: {status.adapter}  profile={status.profile}  "
-        f"environment={status.environment}  wallet={status.wallet_address}  "
-        f"writes={'enabled' if status.writes_enabled else 'disabled'}"
-    )
-    if status.adapter != "mock":
-        _note("note: this backend moves real funds; stage uses mainnet USDC.")
-
-
-# -- output helpers -------------------------------------------------------------
 
 
 def _emit(model: BaseModel) -> None:
@@ -148,15 +94,15 @@ def _fail(message: str, code: int = 1) -> None:
     raise typer.Exit(code)
 
 
-def _open_store() -> ContractStore:
-    return ContractStore(config.db_path())
-
-
-def _load_contract(store: ContractStore, contract_id: str) -> TaskContract:
-    contract = store.get(contract_id)
-    if contract is None:
-        _fail(f"no contract with id {contract_id}")
-    return contract  # type: ignore[return-value]
+def _announce(backend: WalletStatus) -> None:
+    """Print the resolved backend identity before anything else happens."""
+    _note(
+        f"backend: {backend.adapter}  profile={backend.profile}  "
+        f"environment={backend.environment}  wallet={backend.wallet_address}  "
+        f"writes={'enabled' if backend.writes_enabled else 'disabled'}"
+    )
+    if backend.adapter != "mock":
+        _note("note: this backend moves real funds; stage uses mainnet USDC.")
 
 
 def _print_contract(contract: TaskContract) -> None:
@@ -227,6 +173,20 @@ def _print_quote(prepared: PrepareResult, backend: GibworkAdapter, *, err: bool 
         typer.echo(line, err=err)
 
 
+def _print_submission(item: RemoteSubmission) -> None:
+    typer.echo(f"id:         {item.id}")
+    typer.echo(f"task_id:    {item.task_id}")
+    typer.echo(f"status:     {item.status}")
+    typer.echo(f"submitter:  {item.submitter or '-'}")
+    typer.echo(f"created_at: {item.created_at.isoformat() if item.created_at else '-'}")
+    typer.echo(f"rating:     {item.rating if item.rating is not None else '-'}")
+    typer.echo("media:")
+    for m in item.media or ["-"]:
+        typer.echo(f"  {m}")
+    typer.echo("content:")
+    typer.echo(item.content)
+
+
 # -- approval gate --------------------------------------------------------------
 
 
@@ -257,12 +217,17 @@ def _approved(prompt: str, *, confirm: bool, yes: bool) -> bool:
     return typer.confirm(prompt, default=False)
 
 
-def _refuse_if_uncertain(contract: TaskContract) -> None:
-    if contract.status is ContractStatus.SUBMIT_UNCERTAIN:
+def _submit_or_fail(session: MoneySession) -> None:
+    try:
+        session.submit()
+    except AmbiguousSubmit as exc:
         _fail(
-            "a previous submit has an unknown outcome; run "
-            f"`hf contract reconcile {contract.id}` before any further submit"
+            f"{exc} — contract is now {ContractStatus.SUBMIT_UNCERTAIN.value}; "
+            f"run `hf contract reconcile {session.contract.id}`. Do not resubmit.",
+            EXIT_AMBIGUOUS,
         )
+    except AdapterError as exc:
+        _fail(str(exc))
 
 
 # -- commands -------------------------------------------------------------------
@@ -290,7 +255,7 @@ def classify(
     as_json: JsonFlag = False,
 ) -> None:
     """Decide whether a request needs a human, and why."""
-    result = default_classifier().classify(text)
+    result = _service(None).classify(text)
     if as_json:
         _emit(result)
         return
@@ -321,28 +286,20 @@ def contract_create(
     as_json: JsonFlag = False,
 ) -> None:
     """Classify a request, build a Task Contract, and save it."""
-    classification = default_classifier().classify(text)
     try:
-        reward_model = Reward(amount=reward, min_submission_amount=min_submission)
-        contract = build_contract(
+        contract = _service(None).create_contract(
             text,
-            classification,
-            reward_model,
+            reward=reward,
+            min_submission_amount=min_submission,
             title=title,
             tags=tag,
             deadline=deadline,
-            allow_agent_capable=force,
+            force=force,
         )
-    except AgentCapableRequest:
-        _fail(
-            f"classified as agent-capable (confidence {classification.confidence}); "
-            "use --force to build a contract anyway"
-        )
-    except ValidationError as exc:
-        _fail(str(exc))
-
-    with _open_store() as store:
-        store.save(contract)
+    except ServiceError as exc:
+        if exc.code == "AGENT_CAPABLE":
+            _fail(exc.message.replace("pass force=True", "use --force"))
+        _fail(exc.message)
     if as_json:
         _emit(contract)
     else:
@@ -352,8 +309,10 @@ def contract_create(
 @contract_app.command("show")
 def contract_show(contract_id: str, as_json: JsonFlag = False) -> None:
     """Show one contract."""
-    with _open_store() as store:
-        contract = _load_contract(store, contract_id)
+    try:
+        contract = _service(None).get_contract(contract_id)
+    except ServiceError as exc:
+        _fail(exc.message)
     if as_json:
         _emit(contract)
     else:
@@ -367,8 +326,7 @@ def contract_list(
     as_json: JsonFlag = False,
 ) -> None:
     """List saved contracts, newest first."""
-    with _open_store() as store:
-        contracts = store.list(status=status, category=category)
+    contracts = _service(None).list_contracts(status=status, category=category)
     if as_json:
         typer.echo(json.dumps([c.model_dump(mode="json") for c in contracts], indent=2))
         return
@@ -387,28 +345,11 @@ def contract_refresh(
     contract_id: str, adapter: AdapterOpt = None, as_json: JsonFlag = False
 ) -> None:
     """Fetch the bounty's current state from the backend and record it."""
-    with _open_store() as store, _adapter(adapter, writes=False) as backend:
-        contract = _load_contract(store, contract_id)
-        if contract.delegation is None:
-            _fail("contract has not been delegated; nothing to refresh")
-        _announce(backend)
-        try:
-            task = backend.get_task(contract.delegation.task_id)
-        except AdapterError as exc:
-            _fail(str(exc))
-        if task is None:
-            _fail(f"task {contract.delegation.task_id} not found on {backend.name}")
-        now = datetime.now(UTC)
-        contract.remote = RemoteSnapshot(
-            status=task.status,
-            is_open=task.is_open,
-            total_submissions=task.total_submissions,
-            synced_at=now,
-        )
-        if contract.status is ContractStatus.DELEGATED and task.total_submissions:
-            contract.transition_to(ContractStatus.SUBMITTED)
-        contract.updated_at = now
-        store.save(contract)
+    try:
+        contract, backend = _service(adapter).refresh(contract_id)
+    except Failure as exc:
+        _fail(str(exc) if isinstance(exc, AdapterError) else exc.message)
+    _announce(backend)
     if as_json:
         _emit(contract)
     else:
@@ -420,73 +361,18 @@ def contract_reconcile(
     contract_id: str, adapter: AdapterOpt = None, as_json: JsonFlag = False
 ) -> None:
     """Resolve an uncertain submit by checking the backend for its result."""
-    with _open_store() as store, _adapter(adapter, writes=False) as backend:
-        contract = _load_contract(store, contract_id)
-        attempt = contract.uncertain_attempt
-        if contract.status is not ContractStatus.SUBMIT_UNCERTAIN or attempt is None:
-            _fail("contract has no uncertain submit to reconcile")
-        if attempt.adapter != backend.name:
-            _fail(
-                f"attempt was made with adapter {attempt.adapter!r}; "
-                f"reconcile with the same adapter, not {backend.name!r}"
-            )
-        _announce(backend)
-        try:
-            task = backend.get_task(attempt.task_id)
-        except AdapterError as exc:
-            _fail(str(exc))
-
-        now = datetime.now(UTC)
-        if attempt.operation == "task_create":
-            if task is None:
-                typer.echo(
-                    f"task {attempt.task_id} was not found on {backend.name}. The bounty may "
-                    "still settle; check again later. If you have verified it never funded, run "
-                    f"`hf contract resolve {contract.id} --outcome not-created`."
-                )
-                raise typer.Exit(1)
-            attempt.outcome = AttemptOutcome.RECONCILED_CONFIRMED
-            attempt.resolved_at = now
-            contract.delegation = DelegationRecord(
-                adapter=attempt.adapter,
-                task_id=attempt.task_id,
-                intent_id=attempt.intent_id,
-                confirmation_id=attempt.confirmation_id,
-                signature="reconciled",
-                quote=attempt.quote,  # type: ignore[arg-type]
-                delegated_at=now,
-            )
-            contract.transition_to(ContractStatus.DELEGATED)
-            store.save(contract)
-            typer.echo(
-                f"reconciled: task {attempt.task_id} exists on {backend.name}; contract is delegated"
-            )
-        else:
-            if task is None or task.is_open:
-                state = "still open" if task is not None else "not found"
-                typer.echo(
-                    f"task {attempt.task_id} is {state} on {backend.name}. The refund may still "
-                    "settle; check again later. If you have verified it never dispatched, run "
-                    f"`hf contract resolve {contract.id} --outcome not-refunded`."
-                )
-                raise typer.Exit(1)
-            attempt.outcome = AttemptOutcome.RECONCILED_CONFIRMED
-            attempt.resolved_at = now
-            contract.refund = RefundRecord(
-                adapter=attempt.adapter,
-                task_id=attempt.task_id,
-                confirmation_id=attempt.confirmation_id,
-                signature="reconciled",
-                quote=attempt.quote.model_dump(mode="json") if attempt.quote else {},
-                refunded_at=now,
-            )
-            contract.transition_to(ContractStatus.CLOSED)
-            store.save(contract)
-            typer.echo(
-                f"reconciled: task {attempt.task_id} is closed on {backend.name}; contract is closed"
-            )
-    if as_json:
-        _emit(contract)
+    try:
+        result = _service(adapter).reconcile(contract_id)
+    except Failure as exc:
+        _fail(str(exc) if isinstance(exc, AdapterError) else exc.message)
+    _announce(result.backend)
+    if result.outcome == "confirmed":
+        typer.echo(f"reconciled: {result.message}")
+        if as_json:
+            _emit(result.contract)
+        return
+    typer.echo(result.message)
+    raise typer.Exit(1)
 
 
 @contract_app.command("resolve")
@@ -505,60 +391,13 @@ def contract_resolve(
     """Manually clear an uncertain submit after verifying its outcome yourself."""
     if outcome not in ("not-created", "not-refunded"):
         _fail("--outcome must be not-created or not-refunded", EXIT_USAGE)
-    with _open_store() as store:
-        contract = _load_contract(store, contract_id)
-        attempt = contract.uncertain_attempt
-        if contract.status is not ContractStatus.SUBMIT_UNCERTAIN or attempt is None:
-            _fail("contract has no uncertain submit to resolve")
-        expected = "task_create" if outcome == "not-created" else "task_refund"
-        if attempt.operation != expected:
-            _fail(f"uncertain attempt is a {attempt.operation}; --outcome {outcome} does not apply")
-        attempt.outcome = AttemptOutcome.RECONCILED_NOT_FOUND
-        attempt.resolved_at = datetime.now(UTC)
-        contract.transition_to(attempt.origin_status)
-        store.save(contract)
+    try:
+        contract = _service(None).resolve_uncertain(contract_id, outcome)
+    except ServiceError as exc:
+        _fail(exc.message)
     typer.echo(f"resolved: contract returned to {contract.status.value}")
     if as_json:
         _emit(contract)
-
-
-def _run_money_operation(
-    *,
-    contract: TaskContract,
-    store: ContractStore,
-    backend: GibworkAdapter,
-    attempt: DelegationAttempt,
-    prompt: str,
-    confirm: bool,
-    yes: bool,
-    submit: Callable[[str], object],
-) -> object:
-    """Shared approve -> submit-once -> record path for delegate and refund."""
-    contract.attempts.append(attempt)
-    store.save(contract)
-
-    if not _approved(prompt, confirm=confirm, yes=yes):
-        typer.echo("aborted: nothing submitted")
-        raise typer.Exit(1)
-
-    try:
-        return submit(attempt.confirmation_id)
-    except AmbiguousSubmit as exc:
-        attempt.outcome = AttemptOutcome.AMBIGUOUS
-        attempt.error = str(exc)
-        contract.transition_to(ContractStatus.SUBMIT_UNCERTAIN)
-        store.save(contract)
-        _fail(
-            f"{exc} — contract is now {ContractStatus.SUBMIT_UNCERTAIN.value}; "
-            f"run `hf contract reconcile {contract.id}`. Do not resubmit.",
-            EXIT_AMBIGUOUS,
-        )
-    except AdapterError as exc:
-        attempt.outcome = AttemptOutcome.FAILED
-        attempt.error = str(exc)
-        store.save(contract)
-        _fail(str(exc))
-    raise AssertionError  # unreachable
 
 
 @app.command()
@@ -571,73 +410,47 @@ def delegate(
 ) -> None:
     """Prepare a bounty quote for a READY contract; fund it only with --confirm."""
     _check_flags(confirm, yes)
-    with _open_store() as store, _adapter(adapter, writes=True) as backend:
-        contract = _load_contract(store, contract_id)
-        _refuse_if_uncertain(contract)
-        if contract.status not in DELEGATABLE:
-            _fail(f"contract is {contract.status.value}; only ready contracts can be delegated")
-        _announce(backend)
+    try:
+        session = _service(adapter).open_delegation(contract_id)
+    except Failure as exc:
+        _fail(str(exc) if isinstance(exc, AdapterError) else exc.message)
+
+    with session:
+        _announce(session.backend)
         if not confirm:
             _note("dry run: prepare only; nothing will be submitted")
-
         try:
-            prepared = backend.prepare_task(contract)
+            prepared = session.prepare()
         except AdapterError as exc:
             _fail(str(exc))
+        assert isinstance(prepared, PrepareResult)
 
         if not confirm:
             if as_json:
                 _emit(prepared)
             else:
-                _print_quote(prepared, backend)
+                _print_quote(prepared, session.adapter)
                 typer.echo("dry run: nothing submitted. Re-run with --confirm to fund.")
             return
 
-        _print_quote(prepared, backend, err=as_json)
+        _print_quote(prepared, session.adapter, err=as_json)
         q = prepared.payment_quote
-        attempt = DelegationAttempt(
-            operation="task_create",
-            adapter=backend.name,
-            environment=backend.environment,
-            wallet_address=prepared.wallet_address,
-            origin_status=contract.status,
-            task_id=prepared.task_id,
-            confirmation_id=prepared.confirmation_id,
-            intent_id=prepared.intent_id,
-            quote=q,
-            prepared_at=prepared.created_at,
-        )
-        submitted = _run_money_operation(
-            contract=contract,
-            store=store,
-            backend=backend,
-            attempt=attempt,
-            prompt=(
-                f"Fund {q.total_debit} {q.token.symbol} from wallet {prepared.wallet_address} "
-                f"on {backend.name}/{backend.environment}?"
-            ),
+        if not _approved(
+            f"Fund {q.total_debit} {q.token.symbol} from wallet {prepared.wallet_address} "
+            f"on {session.backend.adapter}/{session.backend.environment}?",
             confirm=confirm,
             yes=yes,
-            submit=backend.submit_task,
-        )
-        attempt.outcome = AttemptOutcome.SUBMITTED
-        attempt.resolved_at = submitted.submitted_at  # type: ignore[attr-defined]
-        contract.delegation = DelegationRecord(
-            adapter=backend.name,
-            task_id=submitted.task_id,  # type: ignore[attr-defined]
-            intent_id=submitted.intent_id,  # type: ignore[attr-defined]
-            confirmation_id=submitted.confirmation_id,  # type: ignore[attr-defined]
-            signature=submitted.signature,  # type: ignore[attr-defined]
-            quote=q,
-            delegated_at=submitted.submitted_at,  # type: ignore[attr-defined]
-        )
-        contract.transition_to(ContractStatus.DELEGATED)
-        store.save(contract)
+        ):
+            typer.echo("aborted: nothing submitted")
+            raise typer.Exit(1)
+        _submit_or_fail(session)
 
+    contract = session.contract
     if as_json:
         _emit(contract)
     else:
-        typer.echo(f"delegated {contract.id} via {backend.name}: task_id={contract.delegation.task_id}")
+        assert contract.delegation is not None
+        typer.echo(f"delegated {contract.id} via {session.adapter.name}: task_id={contract.delegation.task_id}")
         typer.echo(f"debited {q.total_debit} {q.token.symbol}")
 
 
@@ -651,30 +464,27 @@ def refund(
 ) -> None:
     """Prepare a refund quote for a delegated bounty; execute it only with --confirm."""
     _check_flags(confirm, yes)
-    with _open_store() as store, _adapter(adapter, writes=True) as backend:
-        contract = _load_contract(store, contract_id)
-        _refuse_if_uncertain(contract)
-        if contract.status not in REFUNDABLE or contract.delegation is None:
-            _fail(f"contract is {contract.status.value}; only delegated bounties can be refunded")
-        if contract.delegation.adapter != backend.name:
-            _fail(
-                f"bounty was created with adapter {contract.delegation.adapter!r}; "
-                f"refund with the same adapter, not {backend.name!r}"
-            )
-        _announce(backend)
+    try:
+        session = _service(adapter).open_refund(contract_id)
+    except Failure as exc:
+        _fail(str(exc) if isinstance(exc, AdapterError) else exc.message)
+
+    with session:
+        _announce(session.backend)
         if not confirm:
             _note("dry run: prepare only; nothing will be submitted")
-
         try:
-            prepared = backend.prepare_refund(contract.delegation.task_id)
+            prepared = session.prepare()
         except AdapterError as exc:
             _fail(str(exc))
+        assert not isinstance(prepared, PrepareResult)
 
-        wallet_address = prepared.wallet_address or backend.wallet_address
+        contract = session.contract
+        wallet_address = prepared.wallet_address or session.backend.wallet_address
         amount = prepared.refund_amount or "?"
         symbol = prepared.token.symbol if prepared.token else contract.reward.symbol
         err = as_json
-        typer.echo(f"adapter:           {backend.name} ({backend.environment})", err=err)
+        typer.echo(f"adapter:           {session.adapter.name} ({session.backend.environment})", err=err)
         typer.echo(f"wallet:            {wallet_address}", err=err)
         typer.echo(f"confirmation_id:   {prepared.confirmation_id}", err=err)
         typer.echo(f"task_id:           {prepared.task_id}", err=err)
@@ -690,48 +500,22 @@ def refund(
                 typer.echo("dry run: nothing submitted. Re-run with --confirm to refund.")
             return
 
-        attempt = DelegationAttempt(
-            operation="task_refund",
-            adapter=backend.name,
-            environment=backend.environment,
-            wallet_address=wallet_address,
-            origin_status=contract.status,
-            task_id=prepared.task_id,
-            confirmation_id=prepared.confirmation_id,
-            intent_id=prepared.intent_id,
-            quote=contract.delegation.quote,
-            prepared_at=prepared.created_at or datetime.now(UTC),
-        )
-        submitted = _run_money_operation(
-            contract=contract,
-            store=store,
-            backend=backend,
-            attempt=attempt,
-            prompt=(
-                f"Refund task {prepared.task_id} ({amount} {symbol}) to wallet {wallet_address} "
-                f"on {backend.name}/{backend.environment}?"
-            ),
+        if not _approved(
+            f"Refund task {prepared.task_id} ({amount} {symbol}) to wallet {wallet_address} "
+            f"on {session.backend.adapter}/{session.backend.environment}?",
             confirm=confirm,
             yes=yes,
-            submit=backend.submit_refund,
-        )
-        attempt.outcome = AttemptOutcome.SUBMITTED
-        attempt.resolved_at = submitted.submitted_at  # type: ignore[attr-defined]
-        contract.refund = RefundRecord(
-            adapter=backend.name,
-            task_id=submitted.task_id,  # type: ignore[attr-defined]
-            confirmation_id=submitted.confirmation_id,  # type: ignore[attr-defined]
-            signature=submitted.signature,  # type: ignore[attr-defined]
-            quote=prepared.raw,
-            refunded_at=submitted.submitted_at,  # type: ignore[attr-defined]
-        )
-        contract.transition_to(ContractStatus.CLOSED)
-        store.save(contract)
+        ):
+            typer.echo("aborted: nothing submitted")
+            raise typer.Exit(1)
+        _submit_or_fail(session)
 
+    contract = session.contract
     if as_json:
         _emit(contract)
     else:
-        typer.echo(f"refunded {contract.id} via {backend.name}: task_id={contract.refund.task_id}")
+        assert contract.refund is not None
+        typer.echo(f"refunded {contract.id} via {session.adapter.name}: task_id={contract.refund.task_id}")
 
 
 @app.command()
@@ -744,15 +528,11 @@ def submissions(
     as_json: JsonFlag = False,
 ) -> None:
     """List submissions on a delegated contract's bounty."""
-    with _open_store() as store, _adapter(adapter, writes=False) as backend:
-        contract = _load_contract(store, contract_id)
-        if contract.delegation is None:
-            _fail("contract has not been delegated")
-        _announce(backend)
-        try:
-            items = backend.list_submissions(contract.delegation.task_id, status=status)
-        except AdapterError as exc:
-            _fail(str(exc))
+    try:
+        items, backend, _ = _service(adapter).list_submissions(contract_id, status=status)
+    except Failure as exc:
+        _fail(str(exc) if isinstance(exc, AdapterError) else exc.message)
+    _announce(backend)
     if as_json:
         typer.echo(json.dumps([s.model_dump(mode="json") for s in items], indent=2))
         return
@@ -772,41 +552,26 @@ def submission(
     as_json: JsonFlag = False,
 ) -> None:
     """Show one submission in full."""
-    with _open_store() as store, _adapter(adapter, writes=False) as backend:
-        contract = _load_contract(store, contract_id)
-        if contract.delegation is None:
-            _fail("contract has not been delegated")
-        _announce(backend)
-        try:
-            item = backend.get_submission(contract.delegation.task_id, submission_id)
-        except AdapterError as exc:
-            _fail(str(exc))
-        if item is None:
-            _fail(f"submission {submission_id} not found")
+    try:
+        item, backend = _service(adapter).get_submission(contract_id, submission_id)
+    except Failure as exc:
+        _fail(str(exc) if isinstance(exc, AdapterError) else exc.message)
+    _announce(backend)
+    if item is None:
+        _fail(f"submission {submission_id} not found")
     if as_json:
         _emit(item)
-        return
-    typer.echo(f"id:         {item.id}")
-    typer.echo(f"task_id:    {item.task_id}")
-    typer.echo(f"status:     {item.status}")
-    typer.echo(f"submitter:  {item.submitter or '-'}")
-    typer.echo(f"created_at: {item.created_at.isoformat() if item.created_at else '-'}")
-    typer.echo(f"rating:     {item.rating if item.rating is not None else '-'}")
-    typer.echo("media:")
-    for m in item.media or ["-"]:
-        typer.echo(f"  {m}")
-    typer.echo("content:")
-    typer.echo(item.content)
+    else:
+        _print_submission(item)
 
 
 @app.command()
 def wallet(adapter: AdapterOpt = None, as_json: JsonFlag = False) -> None:
     """Show the backend's resolved profile, environment, and public wallet address."""
-    with _adapter(adapter, writes=False) as backend:
-        try:
-            status = backend.wallet_status()
-        except AdapterError as exc:
-            _fail(str(exc))
+    try:
+        status = _service(adapter).backend_info()
+    except AdapterError as exc:
+        _fail(str(exc))
     if as_json:
         _emit(status)
         return
@@ -820,18 +585,16 @@ def wallet(adapter: AdapterOpt = None, as_json: JsonFlag = False) -> None:
 @app.command()
 def status() -> None:
     """Show local state: data directory, contract counts, configured adapter."""
-    typer.echo(f"version:   {__version__}")
-    typer.echo(f"data dir:  {config.data_dir()}")
-    with _open_store() as store:
-        counts = store.count_by_status()
-    total = sum(counts.values())
+    stats = _service(None).stats()
+    typer.echo(f"version:   {stats.version}")
+    typer.echo(f"data dir:  {stats.data_dir}")
+    total = sum(stats.counts.values())
     typer.echo(f"contracts: {total}")
     for st in ContractStatus:
-        if st in counts:
-            typer.echo(f"  {st.value:<17} {counts[st]}")
-    name = config.adapter_name()
-    typer.echo(f"adapter:   {name} (from {config.ENV_ADAPTER}; default mock)")
-    if name == "mock":
+        if st.value in stats.counts:
+            typer.echo(f"  {st.value:<17} {stats.counts[st.value]}")
+    typer.echo(f"adapter:   {stats.adapter} (from {config.ENV_ADAPTER}; default mock)")
+    if stats.adapter == "mock":
         backend = MockGibworkAdapter(state_path=config.mock_state_path())
         typer.echo(f"  wallet   {backend.wallet_address}")
         typer.echo(f"  balance  {backend.balance} USDC")
@@ -840,6 +603,26 @@ def status() -> None:
         typer.echo(f"  profile      {config.gibwork_profile() or '(gibwork default)'}")
         typer.echo(f"  environment  {config.gibwork_environment() or '(from profile)'}")
         typer.echo("  run `hf wallet` to resolve the wallet without moving funds")
+
+
+@mcp_app.command("serve")
+def mcp_serve(adapter: AdapterOpt = None) -> None:
+    """Run the HumanFallback MCP server over stdio (no submit tools are exposed)."""
+    from humanfallback.mcp_server import serve
+
+    svc = _service(adapter)
+    try:
+        serve(svc, log=_note)
+    except AdapterError as exc:
+        _fail(str(exc))
+
+
+@mcp_app.command("snippet")
+def mcp_snippet(adapter: AdapterOpt = None) -> None:
+    """Print the commands and JSON needed to register this server with Claude Code."""
+    from humanfallback.mcp_server import claude_code_snippet
+
+    typer.echo(claude_code_snippet(adapter or config.adapter_name()))
 
 
 if __name__ == "__main__":
