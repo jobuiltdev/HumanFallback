@@ -9,6 +9,7 @@
     hf submission <id> <submission-id>
     hf wallet [--adapter ...]
     hf status
+    hf review submission <id> <submission-id> | review all <id> | review rank <id>
     hf mcp serve [--adapter ...] | hf mcp snippet
 
 Money moves only on `--confirm`, and only after the quote is printed and a
@@ -34,6 +35,9 @@ from humanfallback.models import (
     ContractStatus,
     PrepareResult,
     RemoteSubmission,
+    Severity,
+    SubmissionComparison,
+    SubmissionReview,
     TaskCategory,
     TaskContract,
     WalletStatus,
@@ -49,8 +53,13 @@ app = typer.Typer(
 )
 contract_app = typer.Typer(help="Create and inspect Task Contracts.", no_args_is_help=True)
 mcp_app = typer.Typer(help="Expose HumanFallback to MCP-capable agents.", no_args_is_help=True)
+review_app = typer.Typer(
+    help="Advisory review of submissions against the Task Contract. Never approves, rejects, or pays.",
+    no_args_is_help=True,
+)
 app.add_typer(contract_app, name="contract")
 app.add_typer(mcp_app, name="mcp")
+app.add_typer(review_app, name="review")
 
 JsonFlag = Annotated[bool, typer.Option("--json", help="Emit JSON instead of text.")]
 AdapterOpt = Annotated[
@@ -603,6 +612,127 @@ def status() -> None:
         typer.echo(f"  profile      {config.gibwork_profile() or '(gibwork default)'}")
         typer.echo(f"  environment  {config.gibwork_environment() or '(from profile)'}")
         typer.echo("  run `hf wallet` to resolve the wallet without moving funds")
+
+
+# -- review scorecards ------------------------------------------------------------
+
+_MARK = {"pass": "+", "fail": "x", "needs_human": "?", "blocked": "!",
+         "found": "+", "found_unverified_type": "~", "found_constraint_failed": "~", "missing": "x"}
+
+
+def _print_review(review: SubmissionReview) -> None:
+    typer.echo(f"submission:      {review.submission_id}  (by {review.submitter or '-'})")
+    typer.echo(f"contract:        {review.contract_id}")
+    typer.echo(f"score:           {review.score}/100")
+    typer.echo(f"recommendation:  {review.recommendation.value}")
+    typer.echo(f"human judgment:  {'required' if review.human_judgment_required else 'not required'}")
+    typer.echo("evidence:")
+    for e in review.evidence_results:
+        req = "required" if e.required else "optional"
+        typer.echo(f"  [{_MARK[e.outcome.value]}] {e.evidence_id}  {e.kind.value:<12} {req:<9} {e.outcome.value}  {e.detail}")
+    typer.echo("acceptance criteria:")
+    for a in review.acceptance_results:
+        typer.echo(f"  [{_MARK[a.outcome.value]}] {a.criterion_id}  {a.kind.value:<9} {a.outcome.value:<12} {a.statement}  ({a.detail})")
+    typer.echo("deliverables:")
+    for d in review.deliverable_results:
+        typer.echo(f"  [{_MARK[d.outcome]}] {d.name:<28} {d.detail}")
+    if review.missing_requirements:
+        typer.echo("missing:")
+        for m in review.missing_requirements:
+            typer.echo(f"  - {m.kind} {m.id}: {m.description}")
+    factual = [f for f in review.flags if f.kind.value == "factual"]
+    inferred = [f for f in review.flags if f.kind.value == "inferred"]
+    if factual:
+        typer.echo("flags (factual):")
+        for f in factual:
+            typer.echo(f"  [{f.severity.value}] {f.code}: {f.message}")
+    if inferred:
+        typer.echo("flags (inferred; confirm yourself):")
+        for f in inferred:
+            typer.echo(f"  [{f.severity.value}] {f.code}: {f.message}")
+    typer.echo("score breakdown:")
+    for c in review.score_breakdown:
+        typer.echo(f"  {c.name:<20} {c.points:>3}/{c.max_points:<3} {c.reason}")
+    typer.echo(f"summary: {review.summary}")
+
+
+def _print_comparison(cmp: SubmissionComparison) -> None:
+    typer.echo(f"contract: {cmp.contract_id}")
+    typer.echo(f"{'rank':<5} {'score':<6} {'recommendation':<19} {'judgment':<9} {'missing':<8} {'flags':<6} submission")
+    for r in cmp.ranked_reviews:
+        warn = len(r.flags_with(Severity.WARNING)) + len(r.flags_with(Severity.CRITICAL))
+        typer.echo(
+            f"{r.rank:<5} {r.score:<6} {r.recommendation.value:<19} "
+            f"{'yes' if r.human_judgment_required else 'no':<9} {len(r.missing_requirements):<8} {warn:<6} {r.submission_id}"
+        )
+    typer.echo(f"strongest: {cmp.strongest_submission_id or '- (none chosen)'}")
+    typer.echo("notes:")
+    for n in cmp.comparison_notes:
+        typer.echo(f"  - {n}")
+    typer.echo(f"human action: {cmp.human_action_required}")
+
+
+@review_app.command("submission")
+def review_one(
+    contract_id: str,
+    submission_id: str,
+    adapter: AdapterOpt = None,
+    as_json: JsonFlag = False,
+) -> None:
+    """Score one submission against the contract. Advisory only."""
+    try:
+        review, backend = _service(adapter).review_submission(contract_id, submission_id)
+    except Failure as exc:
+        _fail(str(exc) if isinstance(exc, AdapterError) else exc.message)
+    _announce(backend)
+    if as_json:
+        _emit(review)
+    else:
+        _print_review(review)
+
+
+@review_app.command("all")
+def review_all(
+    contract_id: str,
+    status: Annotated[str | None, typer.Option(help="Filter: pending, approved, or rejected.")] = None,
+    adapter: AdapterOpt = None,
+    as_json: JsonFlag = False,
+) -> None:
+    """Score every submission on the contract. Advisory only."""
+    try:
+        reviews, _, backend = _service(adapter).review_all(contract_id, status=status)
+    except Failure as exc:
+        _fail(str(exc) if isinstance(exc, AdapterError) else exc.message)
+    _announce(backend)
+    if as_json:
+        typer.echo(json.dumps([r.model_dump(mode="json") for r in reviews], indent=2))
+        return
+    if not reviews:
+        typer.echo("no submissions")
+        return
+    for i, review in enumerate(reviews):
+        if i:
+            typer.echo("-" * 72)
+        _print_review(review)
+
+
+@review_app.command("rank")
+def review_rank(
+    contract_id: str,
+    status: Annotated[str | None, typer.Option(help="Filter: pending, approved, or rejected.")] = None,
+    adapter: AdapterOpt = None,
+    as_json: JsonFlag = False,
+) -> None:
+    """Rank submissions by verifiable checks. Advisory only; you decide."""
+    try:
+        cmp, backend = _service(adapter).compare_submissions(contract_id, status=status)
+    except Failure as exc:
+        _fail(str(exc) if isinstance(exc, AdapterError) else exc.message)
+    _announce(backend)
+    if as_json:
+        _emit(cmp)
+    else:
+        _print_comparison(cmp)
 
 
 @mcp_app.command("serve")

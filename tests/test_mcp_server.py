@@ -36,10 +36,13 @@ EXPECTED_TOOLS = {
     "delegate_prepare",
     "submission_list",
     "submission_get",
+    "review_submission",
+    "review_all",
+    "review_rank",
     "wallet",
     "status",
 }
-FORBIDDEN_FRAGMENTS = ("submit", "refund", "resolve", "approve", "reject", "pay")
+FORBIDDEN_FRAGMENTS = ("submit_", "_submit", "refund", "resolve", "approve", "reject", "pay")
 
 
 def run(coro: Coroutine[Any, Any, Any]) -> Any:
@@ -167,7 +170,8 @@ class TestSchemas:
 
     def test_annotations(self, harness: Harness) -> None:
         ann = {t.name: t.annotations for t in harness.tools()}
-        read_only = {"classify", "contract_get", "contract_list", "submission_list", "submission_get", "wallet", "status"}
+        read_only = {"classify", "contract_get", "contract_list", "submission_list", "submission_get",
+                     "review_submission", "review_all", "review_rank", "wallet", "status"}
         for name, a in ann.items():
             assert a is not None
             assert a.destructive_hint is False

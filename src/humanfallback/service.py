@@ -37,11 +37,14 @@ from humanfallback.models import (
     RemoteSnapshot,
     RemoteSubmission,
     Reward,
+    SubmissionComparison,
+    SubmissionReview,
     SubmitResult,
     TaskCategory,
     TaskContract,
     WalletStatus,
 )
+from humanfallback.review import compare_reviews, review_submission
 from humanfallback.store import ContractStore
 
 StoreFactory = Callable[[], ContractStore]
@@ -497,6 +500,45 @@ class Service:
         finally:
             adapter.close()
         return item, backend
+
+    # -- advisory review (read-only; never approves, rejects, or pays) --
+
+    def _delegated_contract(self, contract_id: str) -> TaskContract:
+        contract = self.get_contract(contract_id)
+        if contract.delegation is None:
+            raise ServiceError(ServiceCode.NOT_DELEGATED, "contract has not been delegated")
+        return contract
+
+    def review_submission(self, contract_id: str, submission_id: str) -> tuple[SubmissionReview, WalletStatus]:
+        contract = self._delegated_contract(contract_id)
+        assert contract.delegation is not None
+        adapter, backend = self._open_adapter(writes=False)
+        try:
+            item = adapter.get_submission(contract.delegation.task_id, submission_id)
+        finally:
+            adapter.close()
+        if item is None:
+            raise ServiceError(ServiceCode.NOT_FOUND, f"submission {submission_id} not found")
+        return review_submission(contract, item), backend
+
+    def review_all(
+        self, contract_id: str, *, status: str | None = None
+    ) -> tuple[list[SubmissionReview], list[RemoteSubmission], WalletStatus]:
+        contract = self._delegated_contract(contract_id)
+        assert contract.delegation is not None
+        adapter, backend = self._open_adapter(writes=False)
+        try:
+            items = adapter.list_submissions(contract.delegation.task_id, status=status)
+        finally:
+            adapter.close()
+        reviews = [review_submission(contract, item) for item in items]
+        return reviews, items, backend
+
+    def compare_submissions(
+        self, contract_id: str, *, status: str | None = None
+    ) -> tuple[SubmissionComparison, WalletStatus]:
+        reviews, items, backend = self.review_all(contract_id, status=status)
+        return compare_reviews(contract_id, reviews, items), backend
 
     # -- money-moving operations --
 

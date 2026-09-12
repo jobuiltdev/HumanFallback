@@ -33,10 +33,13 @@ from humanfallback.models import (
     ContractStatus,
     PaymentQuote,
     RemoteSubmission,
+    SubmissionComparison,
+    SubmissionReview,
     TaskCategory,
     TaskContract,
     WalletStatus,
 )
+from humanfallback.review import HUMAN_ACTION as REVIEW_HUMAN_ACTION
 from humanfallback.service import ReconcileOutcome, Service, ServiceCode, ServiceError, error_envelope
 
 SERVER_NAME = "humanfallback"
@@ -48,7 +51,9 @@ Typical flow: humanfallback_classify -> humanfallback_contract_create -> humanfa
 
 This server cannot move money. humanfallback_delegate_prepare only returns a quote; the confirmation id it shows is ephemeral and cannot be submitted through MCP or reused anywhere. To fund a bounty a person must run `hf delegate <contract_id> --confirm` in a terminal, which prepares a fresh quote and asks them to approve it. Never tell a person to reuse a confirmation id.
 
-If a contract is `submit_uncertain`, a previous submit had an unknown outcome. Call humanfallback_contract_reconcile; do not attempt anything else on it until it is resolved."""
+If a contract is `submit_uncertain`, a previous submit had an unknown outcome. Call humanfallback_contract_reconcile; do not attempt anything else on it until it is resolved.
+
+Review tools (humanfallback_review_submission, humanfallback_review_all, humanfallback_review_rank) score submissions against the contract with deterministic rules. Their output is advisory: it separates factual checks from inferred warnings and never approves, rejects, or pays. A person decides in Gibwork."""
 
 CONFIRMATION_NOTE = (
     "Ephemeral and informational only. This confirmation expires with this call and "
@@ -144,6 +149,29 @@ class SubmissionView(BaseModel):
     backend: WalletStatus
 
 
+class ReviewView(BaseModel):
+    review: SubmissionReview
+    backend: WalletStatus
+    advisory: bool = True
+    human_action_required: str = REVIEW_HUMAN_ACTION
+
+
+class ReviewListView(BaseModel):
+    contract_id: str
+    reviews: list[SubmissionReview]
+    total: int
+    backend: WalletStatus
+    advisory: bool = True
+    human_action_required: str = REVIEW_HUMAN_ACTION
+
+
+class ComparisonView(BaseModel):
+    comparison: SubmissionComparison
+    backend: WalletStatus
+    advisory: bool = True
+    human_action_required: str = REVIEW_HUMAN_ACTION
+
+
 class StatusView(BaseModel):
     version: str
     adapter: str
@@ -183,9 +211,9 @@ def contract_view(contract: TaskContract, adapter: str, backend: WalletStatus | 
             "or the agent should do the work itself."
         )
     elif status in (ContractStatus.DELEGATED, ContractStatus.SUBMITTED):
-        actions = ["contract_refresh", "submission_list", "submission_get"]
+        actions = ["contract_refresh", "submission_list", "submission_get", "review_all", "review_rank"]
     elif status in (ContractStatus.APPROVED, ContractStatus.REJECTED):
-        actions = ["contract_refresh", "submission_list"]
+        actions = ["contract_refresh", "submission_list", "review_all"]
     else:
         actions = []
     if status is ContractStatus.READY:
@@ -389,6 +417,26 @@ def build_server(service: Service) -> MCPServer:
             raise ServiceError(ServiceCode.NOT_FOUND, f"submission {submission_id} not found")
         return SubmissionView(contract_id=contract_id, submission=item, backend=backend)
 
+    def review_submission(contract_id: str, submission_id: str) -> ReviewView:
+        """Score one submission against its Task Contract with deterministic rules. Advisory only.
+
+        Separates factual checks (evidence found, constraints, exact/pattern criteria) from
+        inferred warnings (relevance, unverified types) and a recommendation. Never approves,
+        rejects, or pays; a person decides in Gibwork.
+        """
+        review, backend = service.review_submission(contract_id, submission_id)
+        return ReviewView(review=review, backend=backend)
+
+    def review_all(contract_id: str, status: str | None = None) -> ReviewListView:
+        """Score every submission on a delegated contract. Advisory only; `status` filters pending, approved, or rejected."""
+        reviews, _, backend = service.review_all(contract_id, status=status)
+        return ReviewListView(contract_id=contract_id, reviews=reviews, total=len(reviews), backend=backend)
+
+    def review_rank(contract_id: str, status: str | None = None) -> ComparisonView:
+        """Rank submissions by verifiable checks and note ties, shared evidence, and what still needs judgment. Advisory only."""
+        comparison, backend = service.compare_submissions(contract_id, status=status)
+        return ComparisonView(comparison=comparison, backend=backend)
+
     def wallet() -> WalletStatus:
         """Show the pinned backend's profile, environment, and public wallet address. Read-only."""
         return service.backend_info()
@@ -409,6 +457,9 @@ def build_server(service: Service) -> MCPServer:
     _register(server, name=PREFIX + "delegate_prepare", output=PrepareView, read_only=False, fn=delegate_prepare)
     _register(server, name=PREFIX + "submission_list", output=SubmissionListView, read_only=True, fn=submission_list)
     _register(server, name=PREFIX + "submission_get", output=SubmissionView, read_only=True, fn=submission_get)
+    _register(server, name=PREFIX + "review_submission", output=ReviewView, read_only=True, fn=review_submission)
+    _register(server, name=PREFIX + "review_all", output=ReviewListView, read_only=True, fn=review_all)
+    _register(server, name=PREFIX + "review_rank", output=ComparisonView, read_only=True, fn=review_rank)
     _register(server, name=PREFIX + "wallet", output=WalletStatus, read_only=True, fn=wallet)
     _register(server, name=PREFIX + "status", output=StatusView, read_only=True, fn=status)
     return server

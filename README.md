@@ -9,13 +9,15 @@ taste. HumanFallback detects those tasks, converts them into structured
 **Task Contracts** with explicit acceptance criteria and evidence
 requirements, and delegates them to people through Gibwork bounties.
 
-## Status: Milestone 3
+## Status: Milestone 4
 
-M1 delivered the local foundation, M2 the real Gibwork integration, and
-M3 exposes HumanFallback itself as an MCP server so agents can use it
-directly. The default backend is still the mock, and nothing reaches
-Gibwork unless you select the `gibwork` adapter. No path, CLI or MCP,
-moves money without a person approving a quote in a terminal.
+M1 delivered the local foundation, M2 the real Gibwork integration, M3
+the MCP server for agents, and M4 a deterministic review layer that
+scores submissions against the Task Contract. The default backend is
+still the mock, and nothing reaches Gibwork unless you select the
+`gibwork` adapter. No path, CLI or MCP, moves money without a person
+approving a quote in a terminal, and nothing approves or rejects a
+submission: reviews are advisory.
 
 | Piece | Where |
 |---|---|
@@ -27,9 +29,10 @@ moves money without a person approving a quote in a terminal.
 | SQLite persistence | `src/humanfallback/store/` |
 | `hf` command-line tool | `src/humanfallback/cli.py` |
 | MCP server for agents | `src/humanfallback/mcp_server.py` |
+| Deterministic submission review | `src/humanfallback/review/`, `models/review.py` |
 
-Not yet: submission approval and rejection, evaluation of returned work,
-a learned classifier.
+Not yet: submission approval and rejection through HumanFallback, a
+learned classifier.
 
 ## Setup
 
@@ -193,6 +196,9 @@ MCP server uses.
 | `humanfallback_delegate_prepare` | `contract_id` | quote + ephemeral confirmation | prepare (no funds move) |
 | `humanfallback_submission_list` | `contract_id`, `status?` | submissions | read |
 | `humanfallback_submission_get` | `contract_id`, `submission_id` | one submission | read |
+| `humanfallback_review_submission` | `contract_id`, `submission_id` | scorecard (advisory) | read |
+| `humanfallback_review_all` | `contract_id`, `status?` | scorecards (advisory) | read |
+| `humanfallback_review_rank` | `contract_id`, `status?` | ranked comparison (advisory) | read |
 | `humanfallback_wallet` | — | profile, environment, wallet | read |
 | `humanfallback_status` | — | version, pinned adapter, counts | none |
 
@@ -219,6 +225,77 @@ That command prepares a **fresh** quote in its own session, prints it, and
 asks the person to approve it. Nothing an agent obtains over MCP can be
 reused to spend.
 
+## Reviewing submissions
+
+Once a bounty has submissions, HumanFallback can score each one against
+the contract's acceptance criteria and evidence requirements with fixed
+rules. The output is a scorecard, not a decision.
+
+```sh
+uv run hf review submission <contract_id> <submission_id>
+uv run hf review all <contract_id> [--status pending]
+uv run hf review rank <contract_id>
+```
+
+The same reviews are available to agents through
+`humanfallback_review_submission`, `humanfallback_review_all`, and
+`humanfallback_review_rank`. Every result carries `advisory: true` and a
+`human_action_required` string; HumanFallback has no approve, reject, or
+pay operation anywhere.
+
+### What a review contains
+
+Three layers, kept apart so it is always clear what was observed and
+what was guessed:
+
+- **Factual checks.** For each evidence requirement: `found`,
+  `found_unverified_type` (present, but a bare media id cannot prove it is
+  a screenshot rather than a photo), `found_constraint_failed`
+  (`min_words`, `url_pattern`, `domain`, `extension`), or `missing`. For
+  each acceptance criterion: `evidence_present`, `exact_match`, and
+  `pattern` criteria pass or fail mechanically; `manual` criteria are
+  `needs_human`, or `blocked` when the evidence they depend on is missing.
+  Body checks: content present, substantive, required evidence supplied,
+  constraints satisfied.
+- **Flags.** Factual: `EMPTY_SUBMISSION`, `NEAR_EMPTY`, `FILLER_ONLY`,
+  `MISSING_REQUIRED_EVIDENCE`, `CONSTRAINT_FAILED`, `DUPLICATE_EVIDENCE`
+  (the same normalised link or media referenced more than once; duplicates
+  are collapsed before matching so one link cannot satisfy two
+  requirements), `UNSUPPORTED_EVIDENCE_TYPE`. Inferred, for a person to
+  confirm: `UNVERIFIED_EVIDENCE_TYPE`, `IRRELEVANT_CONTENT` (none of the
+  request's terms appear in twenty or more words of prose),
+  `LOW_RELEVANCE`, `SUBJECTIVE_ONLY`.
+- **Recommendation** derived from the two above by fixed rules:
+  `reject_candidate`, `incomplete`, `needs_human_review`, `acceptable`,
+  `strong`. `strong` and `acceptable` mean the *verifiable* parts are
+  complete; `human_judgment_required` says whether manual criteria remain,
+  and they almost always do.
+
+### Scoring
+
+100 points, every one attributed to a named component with a reason in
+`score_breakdown`:
+
+| component | max | rule |
+|---|---|---|
+| required evidence | 50 | split equally; found = full, unverified type = half, constraint failed = half, missing = 0 |
+| factual criteria | 30 | split equally; pass = full |
+| deliverables | 20 | content present 10, content substantive 10 |
+| judgment criteria | 0 | never scored |
+
+If a contract has no factual criteria the 30 points move to evidence; if
+it has no required evidence the 50 move to criteria. If it has neither,
+those 80 points are reported as `unverifiable`, the review is flagged
+`SUBJECTIVE_ONLY`, and the recommendation is `needs_human_review` no
+matter how complete the text looks. Inferred flags never change the
+score; they change the recommendation.
+
+`hf review rank` orders submissions by score, then missing items, then
+flags, then submission time. It names a strongest submission only when the
+top result is unique and `strong` or `acceptable`, and notes ties,
+shared evidence across submissions (possible copied work), and how many
+submissions still need judgment.
+
 ## How it fits together
 
 ```
@@ -231,6 +308,7 @@ request text
   -> builder         TaskContract with acceptance criteria + evidence requirements
   -> store           SQLite
   -> adapter         prepare (quote + confirmation id) -> approval -> submit (one-shot)
+  -> review          submissions scored against the contract (advisory)
 ```
 
 ### Task Contract
@@ -295,6 +373,7 @@ src/humanfallback/
   contracts/          build_contract and per-category templates
   adapters/           GibworkAdapter protocol, errors, MockGibworkAdapter,
                       GibworkMcpAdapter, mcp_client, mapping
+  review/             extract, text, rules, compare (deterministic, advisory)
   store/              ContractStore (SQLite)
 tests/
   fakes/              stdio fake MCP server, in-process fake session,
