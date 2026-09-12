@@ -144,3 +144,53 @@ class TestTransitions:
     def test_rejected_can_be_resubmitted(self) -> None:
         c = _contract(status=ContractStatus.REJECTED)
         assert c.can_transition_to(ContractStatus.SUBMITTED)
+
+
+class TestUncertainState:
+    def test_ready_can_enter_uncertain_and_leave_by_reconcile(self) -> None:
+        c = _contract(status=ContractStatus.READY)
+        c.transition_to(ContractStatus.SUBMIT_UNCERTAIN)
+        assert c.can_transition_to(ContractStatus.DELEGATED)
+        assert c.can_transition_to(ContractStatus.READY)
+        assert c.can_transition_to(ContractStatus.CLOSED)
+        assert not c.can_transition_to(ContractStatus.APPROVED)
+
+    def test_delegated_and_submitted_can_enter_uncertain(self) -> None:
+        for start in (ContractStatus.DELEGATED, ContractStatus.SUBMITTED):
+            c = _contract(status=start)
+            assert c.can_transition_to(ContractStatus.SUBMIT_UNCERTAIN)
+
+    def test_draft_cannot_enter_uncertain(self) -> None:
+        assert not _contract().can_transition_to(ContractStatus.SUBMIT_UNCERTAIN)
+
+    def test_uncertain_attempt_property(self) -> None:
+        from datetime import UTC, datetime
+
+        from humanfallback.models import AttemptOutcome, DelegationAttempt
+
+        def attempt(outcome: AttemptOutcome) -> DelegationAttempt:
+            return DelegationAttempt(
+                operation="task_create",
+                adapter="mock",
+                environment="mock",
+                wallet_address="w",
+                origin_status=ContractStatus.READY,
+                task_id="t",
+                confirmation_id="c",
+                prepared_at=datetime.now(UTC),
+                outcome=outcome,
+            )
+
+        c = _contract()
+        assert c.uncertain_attempt is None
+        c.attempts = [attempt(AttemptOutcome.FAILED), attempt(AttemptOutcome.AMBIGUOUS)]
+        assert c.uncertain_attempt is c.attempts[1]
+        c.attempts[1].outcome = AttemptOutcome.RECONCILED_CONFIRMED
+        assert c.uncertain_attempt is None
+
+    def test_delegatable_and_refundable_sets(self) -> None:
+        from humanfallback.models import DELEGATABLE, REFUNDABLE
+
+        assert DELEGATABLE == {ContractStatus.READY}
+        assert REFUNDABLE == {ContractStatus.DELEGATED, ContractStatus.SUBMITTED}
+        assert ContractStatus.SUBMIT_UNCERTAIN not in DELEGATABLE | REFUNDABLE

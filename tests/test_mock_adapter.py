@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from humanfallback.adapters import AdapterError, MockGibworkAdapter
+from humanfallback.adapters import AdapterError, ErrorCode, MockGibworkAdapter
 from humanfallback.adapters.mock import CONFIRMATION_TTL
 from humanfallback.models import USDC_MINT, Reward, TaskContract
 
@@ -44,7 +44,7 @@ class TestPrepare:
     def test_rejects_below_minimum(self, adapter: MockGibworkAdapter, contract: TaskContract) -> None:
         with pytest.raises(AdapterError, match="between 1.00 and 100000.00") as exc:
             adapter.prepare_task(_with_reward(contract, amount="0.50"))
-        assert exc.value.code == "API_ERROR"
+        assert exc.value.code is ErrorCode.AMOUNT_OUT_OF_RANGE
 
     def test_rejects_above_maximum(self, adapter: MockGibworkAdapter, contract: TaskContract) -> None:
         with pytest.raises(AdapterError, match="between"):
@@ -57,12 +57,13 @@ class TestPrepare:
     def test_rejects_unsupported_mint(self, adapter: MockGibworkAdapter, contract: TaskContract) -> None:
         with pytest.raises(AdapterError) as exc:
             adapter.prepare_task(_with_reward(contract, amount="1.00", mint_address="So11111111111111111111111111111111111111112"))
-        assert exc.value.code == "UNSUPPORTED_MINT"
+        assert exc.value.code is ErrorCode.UNSUPPORTED_MINT
 
     def test_rejects_missing_token_account(self, contract: TaskContract) -> None:
         adapter = MockGibworkAdapter(has_token_account=False)
-        with pytest.raises(AdapterError, match="token account"):
+        with pytest.raises(AdapterError, match="token account") as exc:
             adapter.prepare_task(contract)
+        assert exc.value.code is ErrorCode.MISSING_TOKEN_ACCOUNT
 
 
 class TestSubmit:
@@ -93,20 +94,20 @@ class TestSubmit:
         adapter.submit_task(prepared.confirmation_id)
         with pytest.raises(AdapterError) as exc:
             adapter.submit_task(prepared.confirmation_id)
-        assert exc.value.code == "ALREADY_CONSUMED"
+        assert exc.value.code is ErrorCode.CONFIRMATION_INVALID
         assert adapter.balance == Decimal("95.00")
 
     def test_unknown_confirmation(self, adapter: MockGibworkAdapter) -> None:
         with pytest.raises(AdapterError) as exc:
             adapter.submit_task("00000000-0000-4000-8000-000000000000")
-        assert exc.value.code == "UNKNOWN_CONFIRMATION"
+        assert exc.value.code is ErrorCode.CONFIRMATION_INVALID
 
     def test_expires_after_ttl(self, adapter: MockGibworkAdapter, contract: TaskContract, clock: FakeClock) -> None:
         prepared = adapter.prepare_task(contract)
         clock.advance(minutes=5)
         with pytest.raises(AdapterError) as exc:
             adapter.submit_task(prepared.confirmation_id)
-        assert exc.value.code == "EXPIRED"
+        assert exc.value.code is ErrorCode.CONFIRMATION_EXPIRED
 
     def test_valid_just_before_expiry(self, adapter: MockGibworkAdapter, contract: TaskContract, clock: FakeClock) -> None:
         prepared = adapter.prepare_task(contract)
@@ -118,7 +119,7 @@ class TestSubmit:
         prepared = adapter.prepare_task(contract)
         with pytest.raises(AdapterError) as exc:
             adapter.submit_task(prepared.confirmation_id)
-        assert exc.value.code == "INSUFFICIENT_FUNDS"
+        assert exc.value.code is ErrorCode.INSUFFICIENT_FUNDS
         assert adapter.balance == Decimal("2.00")
         assert adapter.list_tasks() == []
 
@@ -142,3 +143,77 @@ class TestPersistence:
         path = tmp_path / "state.json"
         MockGibworkAdapter(state_path=path, balance=Decimal("7.50"))
         assert MockGibworkAdapter(state_path=path).balance == Decimal("7.50")
+
+
+class TestInspection:
+    def test_wallet_status(self, adapter: MockGibworkAdapter) -> None:
+        status = adapter.wallet_status()
+        assert status.adapter == "mock"
+        assert status.environment == "mock"
+        assert status.wallet_address == adapter.wallet_address
+        assert status.writes_enabled is True
+
+    def test_seed_list_get_submissions(self, adapter: MockGibworkAdapter, contract: TaskContract) -> None:
+        prepared = adapter.prepare_task(contract)
+        submitted = adapter.submit_task(prepared.confirmation_id)
+        sub = adapter.seed_submission(submitted.task_id, content="done", submitter="alice")
+        approved = adapter.seed_submission(submitted.task_id, content="also", status="approved")
+        assert [s.id for s in adapter.list_submissions(submitted.task_id)] == [sub.id, approved.id]
+        assert adapter.list_submissions(submitted.task_id, status="pending") == [sub]
+        assert adapter.get_submission(submitted.task_id, sub.id) == sub
+        assert adapter.get_submission(submitted.task_id, "nope") is None
+        assert adapter.get_task(submitted.task_id).total_submissions == 2
+
+    def test_seed_requires_task(self, adapter: MockGibworkAdapter) -> None:
+        with pytest.raises(AdapterError) as exc:
+            adapter.seed_submission("missing", content="x")
+        assert exc.value.code is ErrorCode.NOT_FOUND
+
+
+class TestRefund:
+    def test_refund_round_trip(self, adapter: MockGibworkAdapter, contract: TaskContract) -> None:
+        prepared = adapter.prepare_task(contract)
+        submitted = adapter.submit_task(prepared.confirmation_id)
+        assert adapter.balance == Decimal("95.00")
+
+        refund = adapter.prepare_refund(submitted.task_id)
+        assert refund.task_id == submitted.task_id
+        assert refund.refund_amount == "5.00"
+        assert refund.token is not None and refund.token.symbol == "USDC"
+        assert adapter.balance == Decimal("95.00")  # prepare moves nothing
+
+        result = adapter.submit_refund(refund.confirmation_id)
+        assert result.status == "fulfilled"
+        assert adapter.balance == Decimal("100.00")
+        task = adapter.get_task(submitted.task_id)
+        assert task is not None and task.is_open is False and task.status == "CLOSED"
+
+    def test_refund_unknown_task(self, adapter: MockGibworkAdapter) -> None:
+        with pytest.raises(AdapterError) as exc:
+            adapter.prepare_refund("missing")
+        assert exc.value.code is ErrorCode.NOT_FOUND
+
+    def test_refund_closed_task_rejected(self, adapter: MockGibworkAdapter, contract: TaskContract) -> None:
+        prepared = adapter.prepare_task(contract)
+        submitted = adapter.submit_task(prepared.confirmation_id)
+        refund = adapter.prepare_refund(submitted.task_id)
+        adapter.submit_refund(refund.confirmation_id)
+        with pytest.raises(AdapterError):
+            adapter.prepare_refund(submitted.task_id)
+
+    def test_confirmation_bound_to_operation(self, adapter: MockGibworkAdapter, contract: TaskContract) -> None:
+        prepared = adapter.prepare_task(contract)
+        with pytest.raises(AdapterError) as exc:
+            adapter.submit_refund(prepared.confirmation_id)
+        assert exc.value.code is ErrorCode.CONFIRMATION_INVALID
+        # The mismatched attempt did not consume it.
+        adapter.submit_task(prepared.confirmation_id)
+
+    def test_refund_confirmation_expires(self, adapter: MockGibworkAdapter, contract: TaskContract, clock: FakeClock) -> None:
+        prepared = adapter.prepare_task(contract)
+        submitted = adapter.submit_task(prepared.confirmation_id)
+        refund = adapter.prepare_refund(submitted.task_id)
+        clock.advance(minutes=6)
+        with pytest.raises(AdapterError) as exc:
+            adapter.submit_refund(refund.confirmation_id)
+        assert exc.value.code is ErrorCode.CONFIRMATION_EXPIRED

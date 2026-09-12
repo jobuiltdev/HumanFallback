@@ -16,12 +16,19 @@ AGENT = "Refactor the auth module and write tests."
 
 
 def _run(*args: str) -> tuple[int, str]:
+    """Return exit code and combined stdout+stderr."""
     result = runner.invoke(app, list(args))
     return result.exit_code, result.output
 
 
+def _run_json(*args: str) -> tuple[int, str]:
+    """Return exit code and stdout only, for commands emitting JSON."""
+    result = runner.invoke(app, list(args))
+    return result.exit_code, result.stdout
+
+
 def _create(*extra: str) -> dict:
-    code, out = _run("contract", "create", PHYSICAL, "--json", *extra)
+    code, out = _run_json("contract", "create", PHYSICAL, "--json", *extra)
     assert code == 0, out
     return json.loads(out)
 
@@ -40,7 +47,7 @@ class TestCli:
         assert "physical_action" in out
 
     def test_classify_json(self) -> None:
-        code, out = _run("classify", AGENT, "--json")
+        code, out = _run_json("classify", AGENT, "--json")
         assert code == 0
         data = json.loads(out)
         assert data["human_required"] is False
@@ -64,7 +71,7 @@ class TestCli:
         assert "--force" in out
 
     def test_create_force_yields_draft(self) -> None:
-        code, out = _run("contract", "create", AGENT, "--force", "--json")
+        code, out = _run_json("contract", "create", AGENT, "--force", "--json")
         assert code == 0
         assert json.loads(out)["status"] == "draft"
 
@@ -81,10 +88,10 @@ class TestCli:
         assert code == 0
         assert out.count("\n") == 2
 
-        code, out = _run("contract", "list", "--status", "ready", "--json")
+        code, out = _run_json("contract", "list", "--status", "ready", "--json")
         assert [c["id"] for c in json.loads(out)] == [created["id"]]
 
-        code, out = _run("contract", "list", "--category", "physical_action", "--json")
+        code, out = _run_json("contract", "list", "--category", "physical_action", "--json")
         assert len(json.loads(out)) == 1
 
     def test_list_empty(self) -> None:
@@ -101,10 +108,10 @@ class TestCli:
         created = _create("--reward", "3.00")
         code, out = _run("delegate", created["id"])
         assert code == 0, out
-        assert "total_debit:      3.00" in out
+        assert "total_debit:       3.00" in out
         assert "dry run" in out
 
-        _, shown = _run("contract", "show", created["id"], "--json")
+        _, shown = _run_json("contract", "show", created["id"], "--json")
         assert json.loads(shown)["status"] == "ready"
         state = json.loads((data_dir / "mock_gibwork.json").read_text())
         assert state["balance"] == "100.00"
@@ -112,7 +119,7 @@ class TestCli:
 
     def test_delegate_confirm(self, data_dir: Path) -> None:
         created = _create("--reward", "3.00")
-        code, out = _run("delegate", created["id"], "--confirm", "--json")
+        code, out = _run_json("delegate", created["id"], "--confirm", "--yes", "--json")
         assert code == 0, out
         data = json.loads(out)
         assert data["status"] == "delegated"
@@ -125,10 +132,10 @@ class TestCli:
 
         code, out = _run("delegate", created["id"])
         assert code == 1
-        assert "only READY" in out
+        assert "only ready" in out
 
     def test_delegate_rejects_draft(self) -> None:
-        code, out = _run("contract", "create", AGENT, "--force", "--json")
+        code, out = _run_json("contract", "create", AGENT, "--force", "--json")
         contract_id = json.loads(out)["id"]
         code, out = _run("delegate", contract_id)
         assert code == 1
@@ -136,13 +143,13 @@ class TestCli:
 
     def test_delegate_reports_adapter_errors(self) -> None:
         created = _create("--reward", "5000.00")
-        code, out = _run("delegate", created["id"], "--confirm")
+        code, out = _run("delegate", created["id"], "--confirm", "--yes")
         assert code == 1
         assert "INSUFFICIENT_FUNDS" in out
 
     def test_delegate_unknown_adapter(self) -> None:
         created = _create()
-        code, out = _run("delegate", created["id"], "--adapter", "gibwork")
+        code, out = _run("delegate", created["id"], "--adapter", "nope")
         assert code == 1
         assert "unknown adapter" in out
 

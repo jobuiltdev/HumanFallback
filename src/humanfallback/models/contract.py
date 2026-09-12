@@ -7,6 +7,7 @@ import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -30,6 +31,7 @@ def utcnow() -> datetime:
 class ContractStatus(StrEnum):
     DRAFT = "draft"  # built but not cleared for delegation
     READY = "ready"  # cleared for delegation
+    SUBMIT_UNCERTAIN = "submit_uncertain"  # a money-moving submit has an unknown outcome
     DELEGATED = "delegated"  # bounty created and funded
     SUBMITTED = "submitted"  # at least one submission awaiting review
     APPROVED = "approved"
@@ -37,17 +39,23 @@ class ContractStatus(StrEnum):
     CLOSED = "closed"
 
 
+_S = ContractStatus
+
 TRANSITIONS: dict[ContractStatus, frozenset[ContractStatus]] = {
-    ContractStatus.DRAFT: frozenset({ContractStatus.READY, ContractStatus.CLOSED}),
-    ContractStatus.READY: frozenset(
-        {ContractStatus.DELEGATED, ContractStatus.DRAFT, ContractStatus.CLOSED}
-    ),
-    ContractStatus.DELEGATED: frozenset({ContractStatus.SUBMITTED, ContractStatus.CLOSED}),
-    ContractStatus.SUBMITTED: frozenset({ContractStatus.APPROVED, ContractStatus.REJECTED}),
-    ContractStatus.APPROVED: frozenset({ContractStatus.CLOSED}),
-    ContractStatus.REJECTED: frozenset({ContractStatus.SUBMITTED, ContractStatus.CLOSED}),
-    ContractStatus.CLOSED: frozenset(),
+    _S.DRAFT: frozenset({_S.READY, _S.CLOSED}),
+    _S.READY: frozenset({_S.DELEGATED, _S.DRAFT, _S.CLOSED, _S.SUBMIT_UNCERTAIN}),
+    # Leaves only through reconciliation or an explicit manual resolution.
+    _S.SUBMIT_UNCERTAIN: frozenset({_S.READY, _S.DELEGATED, _S.SUBMITTED, _S.CLOSED}),
+    _S.DELEGATED: frozenset({_S.SUBMITTED, _S.CLOSED, _S.SUBMIT_UNCERTAIN}),
+    _S.SUBMITTED: frozenset({_S.APPROVED, _S.REJECTED, _S.CLOSED, _S.SUBMIT_UNCERTAIN}),
+    _S.APPROVED: frozenset({_S.CLOSED}),
+    _S.REJECTED: frozenset({_S.SUBMITTED, _S.CLOSED}),
+    _S.CLOSED: frozenset(),
 }
+
+# Statuses from which a money-moving submit may be started.
+DELEGATABLE = frozenset({_S.READY})
+REFUNDABLE = frozenset({_S.DELEGATED, _S.SUBMITTED})
 
 
 class InvalidTransition(ValueError):
@@ -92,11 +100,59 @@ class DelegationRecord(BaseModel):
 
     adapter: str
     task_id: str
-    intent_id: str
+    intent_id: str | None
     confirmation_id: str
     signature: str
     quote: PaymentQuote
     delegated_at: datetime
+
+
+MoneyOperation = Literal["task_create", "task_refund"]
+
+
+class AttemptOutcome(StrEnum):
+    PREPARED = "prepared"  # quote obtained, nothing dispatched
+    SUBMITTED = "submitted"  # backend confirmed the submit
+    FAILED = "failed"  # backend rejected before dispatch; safe to retry
+    AMBIGUOUS = "ambiguous"  # dispatched, outcome unknown; never retry
+    RECONCILED_CONFIRMED = "reconciled_confirmed"
+    RECONCILED_NOT_FOUND = "reconciled_not_found"
+
+
+class DelegationAttempt(BaseModel):
+    """Audit record for one prepare/submit cycle of a money-moving operation."""
+
+    operation: MoneyOperation
+    adapter: str
+    environment: str
+    wallet_address: str
+    origin_status: ContractStatus
+    task_id: str
+    confirmation_id: str
+    intent_id: str | None = None
+    quote: PaymentQuote | None = None
+    prepared_at: datetime
+    outcome: AttemptOutcome = AttemptOutcome.PREPARED
+    error: str | None = None
+    resolved_at: datetime | None = None
+
+
+class RefundRecord(BaseModel):
+    adapter: str
+    task_id: str
+    confirmation_id: str
+    signature: str
+    quote: dict[str, Any] = Field(default_factory=dict)
+    refunded_at: datetime
+
+
+class RemoteSnapshot(BaseModel):
+    """Last observed state of the bounty on the backend."""
+
+    status: str
+    is_open: bool
+    total_submissions: int | None = None
+    synced_at: datetime
 
 
 class TaskContract(BaseModel):
@@ -112,6 +168,9 @@ class TaskContract(BaseModel):
     tags: list[str] = Field(default_factory=list, max_length=MAX_TAGS)
     status: ContractStatus = ContractStatus.DRAFT
     delegation: DelegationRecord | None = None
+    refund: RefundRecord | None = None
+    remote: RemoteSnapshot | None = None
+    attempts: list[DelegationAttempt] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
@@ -144,6 +203,14 @@ class TaskContract(BaseModel):
                     f"criterion {criterion.id} references unknown evidence {missing}"
                 )
         return self
+
+    @property
+    def uncertain_attempt(self) -> DelegationAttempt | None:
+        """The attempt blocking further submits, if any."""
+        for attempt in reversed(self.attempts):
+            if attempt.outcome is AttemptOutcome.AMBIGUOUS:
+                return attempt
+        return None
 
     def can_transition_to(self, new_status: ContractStatus) -> bool:
         return new_status in TRANSITIONS[self.status]

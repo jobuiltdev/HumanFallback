@@ -1,17 +1,31 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from humanfallback.adapters import MockGibworkAdapter
+from humanfallback import cli
+from humanfallback.adapters import AdapterError, ErrorCode, MockGibworkAdapter
 from humanfallback.classifier import default_classifier
 from humanfallback.contracts import build_contract
 from humanfallback.models import Reward, TaskContract
 from humanfallback.store import ContractStore
 
 PHYSICAL_REQUEST = "Go to the hardware store on Main St and take a photo of the paint aisle."
+
+
+@pytest.fixture(autouse=True)
+def _never_touch_real_gibwork(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test may spawn the real Gibwork CLI. Tests that need the gibwork
+    adapter install their own fake factory on top of this guard."""
+    monkeypatch.setenv("HF_GIBWORK_BIN", str(Path("/nonexistent/gibwork-must-not-run")))
+    monkeypatch.delenv("HF_ADAPTER", raising=False)
+
+    def refuse(writes: bool):  # noqa: ANN202
+        raise AdapterError(ErrorCode.CONFIG_ERROR, "real gibwork adapter is disabled in tests")
+
+    monkeypatch.setitem(cli.ADAPTER_FACTORIES, "gibwork", refuse)
 
 
 @pytest.fixture
@@ -36,8 +50,6 @@ class FakeClock:
         return self.now
 
     def advance(self, **kwargs: int) -> None:
-        from datetime import timedelta
-
         self.now += timedelta(**kwargs)
 
 
