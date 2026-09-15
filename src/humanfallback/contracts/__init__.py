@@ -1,3 +1,3 @@
-from .builder import AgentCapableRequest, build_contract, derive_title
+from .builder import AgentCapableRequest, ContractSpec, build_contract, derive_title
 
-__all__ = ["AgentCapableRequest", "build_contract", "derive_title"]
+__all__ = ["AgentCapableRequest", "ContractSpec", "build_contract", "derive_title"]

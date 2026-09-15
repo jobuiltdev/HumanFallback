@@ -169,6 +169,12 @@ def map_refund_prepare(payload: dict[str, Any], *, task_id: str) -> RefundPrepar
 
 # -- tasks --------------------------------------------------------------------
 
+_SUBMISSION_COUNT_KEYS = (
+    "taskSubmissionsPendingCount",
+    "taskSubmissionsApprovedCount",
+    "taskSubmissionsRejectedCount",
+)
+
 
 def map_remote_task(payload: dict[str, Any]) -> RemoteTask:
     asset = payload.get("asset") or {}
@@ -182,6 +188,11 @@ def map_remote_task(payload: dict[str, Any]) -> RemoteTask:
     if is_open is None:
         is_open = status.upper() == "CREATED"
     total = payload.get("totalSubmissions")
+    if total is None:
+        # gibwork_task_get reports per-status counts instead of a total.
+        counts = [payload.get(k) for k in _SUBMISSION_COUNT_KEYS]
+        if any(c is not None for c in counts):
+            total = sum(int(c or 0) for c in counts)
     max_sub = payload.get("maxSubmissions")
     return RemoteTask(
         id=str(payload["id"]),

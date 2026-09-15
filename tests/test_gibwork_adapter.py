@@ -93,6 +93,41 @@ class TestInspection:
         assert adapter.get_task(P.TASK_ITEM["id"]) is not None
         assert adapter.get_task("missing") is None
 
+    def test_get_task_uses_task_get_tool(self) -> None:
+        session = _happy_session()
+        session.handlers["gibwork_task_get"] = returns(P.TASK_GET_ITEM)
+        adapter = _adapter(session, writes=False)
+        task = adapter.get_task(P.TASK_ITEM["id"])
+        assert task is not None and task.total_submissions == 3
+        assert session.calls[-1][:2] == ("gibwork_task_get", {"taskId": P.TASK_ITEM["id"]})
+        assert session.count("gibwork_task_list") == 0
+
+    def test_get_task_not_found_from_task_get(self) -> None:
+        session = _happy_session()
+        session.handlers["gibwork_task_get"] = tool_error(
+            {"error": {"code": "API_ERROR", "message": "Task not found", "details": {"status": 404}}}
+        )
+        adapter = _adapter(session, writes=False)
+        assert adapter.get_task(P.TASK_ITEM["id"]) is None
+        assert session.count("gibwork_task_list") == 0
+
+    def test_get_task_falls_back_to_list_without_tool(self) -> None:
+        # No gibwork_task_get handler: the fake answers USAGE_ERROR like an
+        # older runtime that never registered the tool.
+        session = _happy_session()
+        adapter = _adapter(session, writes=False)
+        assert adapter.get_task(P.TASK_ITEM["id"]) is not None
+        assert session.count("gibwork_task_get") == 1
+        assert session.count("gibwork_task_list") == 1
+
+    def test_get_task_propagates_other_errors(self) -> None:
+        session = _happy_session()
+        session.handlers["gibwork_task_get"] = tool_error(P.ERROR_CREDENTIAL)
+        adapter = _adapter(session, writes=False)
+        with pytest.raises(AdapterError) as exc:
+            adapter.get_task(P.TASK_ITEM["id"])
+        assert exc.value.code is ErrorCode.CREDENTIAL_ERROR
+
     def test_list_submissions_passes_filter(self) -> None:
         session = _happy_session()
         adapter = _adapter(session, writes=False)

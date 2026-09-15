@@ -5,7 +5,9 @@ from datetime import UTC, datetime
 import pytest
 
 from humanfallback.classifier import default_classifier
-from humanfallback.contracts import AgentCapableRequest, build_contract, derive_title
+from pydantic import ValidationError
+
+from humanfallback.contracts import AgentCapableRequest, ContractSpec, build_contract, derive_title
 from humanfallback.contracts.builder import TEMPLATES
 from humanfallback.models import (
     CheckType,
@@ -116,3 +118,64 @@ class TestBuildContract:
         c = build_contract(req, default_classifier().classify(req), Reward(amount="1.00"))
         assert c.classification.category is TaskCategory.HUMAN_INTERACTION
         assert c.source_request == req
+
+
+def _spec(**overrides) -> dict:
+    data = {
+        "evidence_requirements": [
+            {"id": "ev-1", "kind": "screenshot", "description": "Terminal screenshot"},
+            {"id": "ev-2", "kind": "text", "description": "Output and feedback", "constraints": {"min_words": "60"}},
+        ],
+        "acceptance_criteria": [
+            {"id": "ac-1", "statement": "Fulfils the request", "evidence_ids": ["ev-1", "ev-2"]},
+            {"id": "ac-2", "statement": "Screenshot attached", "check_type": "evidence_present", "evidence_ids": ["ev-1"]},
+            {"id": "ac-3", "statement": "Version shown", "check_type": "pattern", "expected": r"humanfallback\s+0\.4\.0", "evidence_ids": ["ev-2"]},
+        ],
+    }
+    data.update(overrides)
+    return data
+
+
+class TestContractSpec:
+    def test_spec_replaces_template(self) -> None:
+        spec = ContractSpec.model_validate(_spec())
+        contract = build_contract(
+            "Verify the setup and give your human feedback",
+            _classified(TaskCategory.SUBJECTIVE_JUDGMENT),
+            Reward(amount="1.00"),
+            spec=spec,
+        )
+        assert [e.id for e in contract.evidence_requirements] == ["ev-1", "ev-2"]
+        assert contract.evidence_requirements[0].kind is EvidenceKind.SCREENSHOT
+        assert contract.evidence_requirements[1].constraints == {"min_words": "60"}
+        assert [c.check_type for c in contract.acceptance_criteria] == [
+            CheckType.MANUAL, CheckType.EVIDENCE_PRESENT, CheckType.PATTERN
+        ]
+        assert contract.acceptance_criteria[2].expected == r"humanfallback\s+0\.4\.0"
+        assert contract.status is ContractStatus.READY
+
+    def test_spec_is_copied_not_shared(self) -> None:
+        spec = ContractSpec.model_validate(_spec())
+        contract = build_contract("Verify", _classified(TaskCategory.SUBJECTIVE_JUDGMENT), Reward(amount="1.00"), spec=spec)
+        contract.evidence_requirements[1].constraints["min_words"] = "1"
+        assert spec.evidence_requirements[1].constraints["min_words"] == "60"
+
+    def test_spec_still_refuses_agent_capable(self) -> None:
+        with pytest.raises(AgentCapableRequest):
+            build_contract("Write it", _classified(TaskCategory.AGENT_CAPABLE, human=False),
+                           Reward(amount="1.00"), spec=ContractSpec.model_validate(_spec()))
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({"evidence_requirements": []}, "at least 1 item"),
+            ({"acceptance_criteria": []}, "at least 1 item"),
+            ({"acceptance_criteria": [{"id": "ac-1", "statement": "x", "evidence_ids": ["ev-9"]}]}, "unknown evidence"),
+            ({"acceptance_criteria": [{"id": "ac-1", "statement": "x", "check_type": "pattern"}]}, "no expected value"),
+            ({"acceptance_criteria": [{"id": "ac-1", "statement": "x"}, {"id": "ac-1", "statement": "y"}]}, "must be unique"),
+            ({"evidence_requirements": [{"id": "ev-1", "kind": "hologram", "description": "x"}]}, "kind"),
+        ],
+    )
+    def test_spec_validation(self, overrides: dict, message: str) -> None:
+        with pytest.raises(ValidationError, match=message):
+            ContractSpec.model_validate(_spec(**overrides))

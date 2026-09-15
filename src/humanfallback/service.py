@@ -21,7 +21,7 @@ from humanfallback import __version__, config
 from humanfallback.adapters import AdapterError, AmbiguousSubmit, GibworkAdapter
 from humanfallback.backends import AdapterFactory
 from humanfallback.classifier import default_classifier
-from humanfallback.contracts import AgentCapableRequest, build_contract
+from humanfallback.contracts import AgentCapableRequest, ContractSpec, build_contract
 from humanfallback.models import (
     DELEGATABLE,
     REFUNDABLE,
@@ -310,10 +310,13 @@ class Service:
         tags: list[str] | None = None,
         deadline: datetime | None = None,
         force: bool = False,
+        spec: ContractSpec | dict[str, Any] | None = None,
     ) -> TaskContract:
         classification = self.classify(text)
         try:
             reward_model = Reward(amount=reward, min_submission_amount=min_submission_amount)
+            if spec is not None and not isinstance(spec, ContractSpec):
+                spec = ContractSpec.model_validate(spec)
             contract = build_contract(
                 text,
                 classification,
@@ -322,6 +325,7 @@ class Service:
                 tags=tags,
                 deadline=deadline,
                 allow_agent_capable=force,
+                spec=spec,
             )
         except AgentCapableRequest:
             raise ServiceError(

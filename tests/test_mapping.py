@@ -118,6 +118,19 @@ class TestTask:
         assert t.total_submissions == 1
         assert t.max_submissions == 10
 
+    def test_maps_task_get_item(self) -> None:
+        t = M.map_remote_task(P.TASK_GET_ITEM)
+        assert t.id == P.TASK_ITEM["id"]
+        assert t.funding_amount == "10.00"
+        assert t.min_submission_amount == "1.00"
+        assert t.total_submissions == 3  # pending 2 + approved 1 + rejected 0
+        assert t.max_submissions == 10
+        assert t.can_refund is None
+
+    def test_total_submissions_unknown_without_any_count(self) -> None:
+        item = {k: v for k, v in P.TASK_GET_ITEM.items() if not k.startswith("taskSubmissions")}
+        assert M.map_remote_task(item).total_submissions is None
+
     def test_is_open_derived_from_status(self) -> None:
         item = {**P.TASK_ITEM}
         del item["isOpen"]

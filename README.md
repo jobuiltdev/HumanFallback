@@ -53,6 +53,10 @@ uv run hf classify "Go to the hardware store and take a photo of the shelf"
 uv run hf contract create "Go to the hardware store and take a photo of the shelf" \
     --reward 5.00 --tag errand --tag photo
 
+# Or say exactly what to check instead of taking the category template
+uv run hf contract create "Verify the setup instructions and give your human feedback" \
+    --reward 1.00 --spec docs/m5/spec.json
+
 uv run hf contract list
 uv run hf contract show <id>
 
@@ -66,6 +70,12 @@ uv run hf status
 ```
 
 Every command accepts `--json` for machine-readable output.
+
+`--spec` takes a JSON file with `evidence_requirements` and
+`acceptance_criteria` in the schema below; they replace the category
+template verbatim, so `pattern`, `exact_match`, and evidence constraints
+such as `min_words` can be stated up front. `docs/m5/spec.json` is a
+complete example.
 
 Local state lives in `~/.humanfallback/` (override with `HF_HOME`).
 
@@ -342,7 +352,9 @@ strongest category clears the threshold and beats the counter-score. The
 
 Both adapters implement the same `GibworkAdapter` protocol: wallet status,
 task list/get, submission list/get, task prepare/submit, refund
-prepare/submit.
+prepare/submit. Task lookup uses `gibwork_task_get` (CLI 0.2.4 and later),
+whose payload reports per-status submission counts rather than a total;
+runtimes without that tool fall back to scanning the wallet's task list.
 
 `MockGibworkAdapter` reproduces the constraints observed on the Gibwork
 staging API: funding between 1.00 and 100000.00, a required token account,

@@ -40,6 +40,7 @@ SUPPORTED_MINTS: frozenset[str] = frozenset({USDC_MINT})
 
 TOOL_WALLET_STATUS = "gibwork_wallet_status"
 TOOL_TASK_LIST = "gibwork_task_list"
+TOOL_TASK_GET = "gibwork_task_get"
 TOOL_TASK_CREATE_PREPARE = "gibwork_task_create_prepare"
 TOOL_TASK_CREATE_SUBMIT = "gibwork_task_create_submit"
 TOOL_TASK_REFUND_PREPARE = "gibwork_task_refund_prepare"
@@ -175,6 +176,18 @@ class GibworkMcpAdapter:
         return [mapping.map_remote_task(item) for item in mapping.unwrap_list(payload)]
 
     def get_task(self, task_id: str) -> RemoteTask | None:
+        """Fetch one task by id (CLI 0.2.4+); older runtimes without the tool
+        fall back to scanning the wallet's task list."""
+        try:
+            payload = self._call(TOOL_TASK_GET, {"taskId": task_id})
+        except AdapterError as exc:
+            if exc.code is ErrorCode.NOT_FOUND:
+                return None
+            if exc.code is not ErrorCode.CONFIG_ERROR:
+                raise
+            payload = None
+        if isinstance(payload, dict) and payload.get("id"):
+            return mapping.map_remote_task(payload)
         for task in self.list_tasks():
             if task.id == task_id:
                 return task

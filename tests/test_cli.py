@@ -75,6 +75,41 @@ class TestCli:
         assert code == 0
         assert json.loads(out)["status"] == "draft"
 
+    def test_create_with_spec(self, tmp_path: Path) -> None:
+        spec = tmp_path / "spec.json"
+        spec.write_text(json.dumps({
+            "evidence_requirements": [
+                {"id": "ev-1", "kind": "screenshot", "description": "Terminal screenshot"},
+                {"id": "ev-2", "kind": "text", "description": "Feedback", "constraints": {"min_words": "60"}},
+            ],
+            "acceptance_criteria": [
+                {"id": "ac-1", "statement": "Version shown", "check_type": "pattern",
+                 "expected": "humanfallback 0.4.0", "evidence_ids": ["ev-2"]},
+            ],
+        }), encoding="utf-8")
+        created = _create("--spec", str(spec))
+        assert [e["kind"] for e in created["evidence_requirements"]] == ["screenshot", "text"]
+        assert created["acceptance_criteria"][0]["check_type"] == "pattern"
+        code, out = _run("contract", "show", created["id"])
+        assert code == 0
+        assert "[pattern]" in out and "[screenshot]" in out
+
+    def test_create_with_invalid_spec(self, tmp_path: Path) -> None:
+        spec = tmp_path / "spec.json"
+        spec.write_text(json.dumps({"evidence_requirements": [], "acceptance_criteria": []}), encoding="utf-8")
+        code, out = _run("contract", "create", PHYSICAL, "--spec", str(spec))
+        assert code == 1
+        assert "evidence_requirements" in out
+
+    def test_create_with_unreadable_spec(self, tmp_path: Path) -> None:
+        spec = tmp_path / "spec.json"
+        spec.write_text("[1, 2]", encoding="utf-8")
+        code, out = _run("contract", "create", PHYSICAL, "--spec", str(spec))
+        assert code == 2
+        assert "JSON object" in out
+        code, out = _run("contract", "create", PHYSICAL, "--spec", str(tmp_path / "nope.json"))
+        assert code == 2
+
     def test_create_rejects_bad_reward(self) -> None:
         code, out = _run("contract", "create", PHYSICAL, "--reward", "5")
         assert code == 1

@@ -74,6 +74,41 @@ TASK_ITEM = {
 }
 
 TASK_LIST = {"results": [TASK_ITEM], "page": 1, "limit": 50, "total": 1, "lastPage": 1}
+
+# gibwork_task_get (CLI 0.2.4 / MCP 0.3.1): no totalSubmissions, per-status
+# counts instead, minSubmissionAmount as a number, no canRefund.
+TASK_GET_ITEM = {
+    "id": TASK_ITEM["id"],
+    "title": TASK_ITEM["title"],
+    "content": TASK_ITEM["content"],
+    "requirements": "",
+    "tags": ["Social Media", "Design"],
+    "primarySkill": {"slug": "other", "label": "Other"},
+    "isFeatured": False,
+    "createdAt": "2026-08-29T22:43:14.470Z",
+    "isOpen": True,
+    "slug": TASK_ITEM["slug"],
+    "refundTransactionId": None,
+    "allowOnlyVerifiedSubmissions": False,
+    "maxSubmissions": 10,
+    "deadline": None,
+    "taskSubmissionsApprovedCount": 1,
+    "taskSubmissionsPendingCount": 2,
+    "taskSubmissionsRejectedCount": 0,
+    "minSubmissionAmount": 1,
+    "status": "CREATED",
+    "media": [],
+    "asset": {
+        "id": "da683d02-0c05-4bb1-be7a-0af1b284a075",
+        "mintAddress": USDC,
+        "symbol": "USDC",
+        "amount": "10000000",
+        "price": 1,
+        "decimals": 6,
+    },
+    "hasSubmission": False,
+    "userSubmissionStatus": None,
+}
 TASK_LIST_EMPTY = {"results": [], "page": 1, "limit": 50, "total": 0, "lastPage": 0}
 
 SUBMISSION_ITEM = {

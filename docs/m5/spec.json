@@ -1,0 +1,62 @@
+{
+  "evidence_requirements": [
+    {
+      "id": "ev-1",
+      "kind": "screenshot",
+      "description": "Screenshot of your terminal showing the output of `uv run hf --version` and `uv run hf classify ...`"
+    },
+    {
+      "id": "ev-2",
+      "kind": "text",
+      "description": "Pasted command output plus written usability feedback (at least 60 words in total)",
+      "constraints": {"min_words": "60"}
+    }
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "ac-1",
+      "statement": "Submission fulfils the request as described",
+      "evidence_ids": ["ev-1", "ev-2"]
+    },
+    {
+      "id": "ac-2",
+      "statement": "Terminal screenshot is attached",
+      "check_type": "evidence_present",
+      "evidence_ids": ["ev-1"]
+    },
+    {
+      "id": "ac-3",
+      "statement": "Exact output of `cmd /c ver` is pasted (Microsoft Windows [Version ...])",
+      "check_type": "pattern",
+      "expected": "Microsoft Windows \\[Version [\\d.]+\\]",
+      "evidence_ids": ["ev-2"]
+    },
+    {
+      "id": "ac-4",
+      "statement": "`uv run hf --version` output shows humanfallback 0.4.0",
+      "check_type": "pattern",
+      "expected": "humanfallback\\s+0\\.4\\.0",
+      "evidence_ids": ["ev-2"]
+    },
+    {
+      "id": "ac-5",
+      "statement": "`uv run hf classify` output shows category physical_action",
+      "check_type": "pattern",
+      "expected": "category:\\s*physical_action",
+      "evidence_ids": ["ev-2"]
+    },
+    {
+      "id": "ac-6",
+      "statement": "Feedback names at least one concrete thing that was confusing, slow, or broken, or states specifically why nothing was",
+      "evidence_ids": ["ev-2"]
+    },
+    {
+      "id": "ac-7",
+      "statement": "Optional: `uv run pytest` summary line is pasted (N passed)",
+      "check_type": "pattern",
+      "expected": "\\d+ passed",
+      "required": false,
+      "evidence_ids": ["ev-2"]
+    }
+  ]
+}

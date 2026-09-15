@@ -1,7 +1,7 @@
 """Command-line interface.
 
     hf classify "<request>"
-    hf contract create "<request>" [--reward 1.00] [--title ...] [--tag ...]
+    hf contract create "<request>" [--reward 1.00] [--title ...] [--tag ...] [--spec file.json]
     hf contract show <id> | list | refresh <id> | reconcile <id> | resolve <id> --outcome ...
     hf delegate <id> [--adapter mock|gibwork] [--confirm [--yes]]
     hf refund <id>   [--adapter mock|gibwork] [--confirm [--yes]]
@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -292,9 +293,28 @@ def contract_create(
     force: Annotated[
         bool, typer.Option("--force", help="Build a contract even if classified agent-capable.")
     ] = False,
+    spec: Annotated[
+        Path | None,
+        typer.Option(
+            "--spec",
+            help="JSON file with explicit evidence_requirements and acceptance_criteria; "
+            "replaces the category template.",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = None,
     as_json: JsonFlag = False,
 ) -> None:
     """Classify a request, build a Task Contract, and save it."""
+    spec_data = None
+    if spec is not None:
+        try:
+            spec_data = json.loads(spec.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            _fail(f"cannot read spec {spec}: {exc}", EXIT_USAGE)
+        if not isinstance(spec_data, dict):
+            _fail(f"spec {spec} must contain a JSON object", EXIT_USAGE)
     try:
         contract = _service(None).create_contract(
             text,
@@ -304,6 +324,7 @@ def contract_create(
             tags=tag,
             deadline=deadline,
             force=force,
+            spec=spec_data,
         )
     except ServiceError as exc:
         if exc.code == "AGENT_CAPABLE":
