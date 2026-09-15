@@ -34,6 +34,7 @@ class CheckOutcome(StrEnum):
     FAIL = "fail"
     NEEDS_HUMAN = "needs_human"  # judgment criterion whose evidence is present
     BLOCKED = "blocked"  # judgment criterion whose evidence is missing
+    NOT_APPLICABLE = "not_applicable"  # optional criterion whose input was not supplied
 
 
 class EvidenceOutcome(StrEnum):

@@ -265,6 +265,10 @@ what was guessed:
   each acceptance criterion: `evidence_present`, `exact_match`, and
   `pattern` criteria pass or fail mechanically; `manual` criteria are
   `needs_human`, or `blocked` when the evidence they depend on is missing.
+  An optional criterion (`required: false`) whose input was not supplied
+  is `not_applicable`: it is not a missing requirement, it is left out of
+  the score entirely, and it can never make a submission incomplete. When
+  the input is supplied it is judged like any other criterion.
   Body checks: content present, substantive, required evidence supplied,
   constraints satisfied.
 - **Flags.** Factual: `EMPTY_SUBMISSION`, `NEAR_EMPTY`, `FILLER_ONLY`,
@@ -289,7 +293,7 @@ what was guessed:
 | component | max | rule |
 |---|---|---|
 | required evidence | 50 | split equally; found = full, unverified type = half, constraint failed = half, missing = 0 |
-| factual criteria | 30 | split equally; pass = full |
+| factual criteria | 30 | split equally among criteria that were supplied; pass = full |
 | deliverables | 20 | content present 10, content substantive 10 |
 | judgment criteria | 0 | never scored |
 

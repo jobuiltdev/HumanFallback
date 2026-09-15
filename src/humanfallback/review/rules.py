@@ -77,6 +77,12 @@ _UNVERIFIED: dict[EvidenceKind, frozenset[str]] = {
 FACTUAL_CHECKS = (CheckType.EVIDENCE_PRESENT, CheckType.EXACT_MATCH, CheckType.PATTERN)
 
 
+def counted_factual(criteria: list[CriterionResult]) -> list[CriterionResult]:
+    """Factual criteria that take part in the score: optional ones whose
+    input was never supplied are left out of both numerator and denominator."""
+    return [c for c in criteria if c.kind is CheckKind.FACTUAL and c.outcome is not CheckOutcome.NOT_APPLICABLE]
+
+
 # -- evidence ---------------------------------------------------------------------
 
 
@@ -162,7 +168,8 @@ def evaluate_evidence(contract: TaskContract, ex: Extracted) -> list[EvidenceRes
             )
         else:
             outcome = EvidenceOutcome.FOUND
-            detail = f"{item.kind} evidence {item.value}"
+            where = " (inline <img> in content)" if item.source == "inline_image" else ""
+            detail = f"{item.kind} evidence {item.value}{where}"
         results[req.id] = EvidenceResult(
             evidence_id=req.id, kind=req.kind, required=req.required, outcome=outcome,
             matched=[item.value], constraint_results=constraints, detail=detail,
@@ -216,6 +223,12 @@ def evaluate_criteria(
             except re.error as exc:
                 found, detail = False, f"invalid pattern {ac.expected!r}: {exc}"
             outcome = CheckOutcome.PASS if found else CheckOutcome.FAIL
+
+        if not ac.required and outcome in (CheckOutcome.FAIL, CheckOutcome.BLOCKED):
+            # An optional criterion whose input was not supplied is skipped: it
+            # is neither missing nor counted. Supplied inputs are judged as usual.
+            outcome = CheckOutcome.NOT_APPLICABLE
+            detail = f"optional and not supplied ({detail}); not counted"
 
         results.append(
             CriterionResult(
@@ -363,19 +376,23 @@ def _evidence_credit(r: EvidenceResult) -> float:
 
 def score(evidence: list[EvidenceResult], criteria: list[CriterionResult], deliverables: list[DeliverableResult]) -> tuple[int, list[ScoreComponent]]:
     required = [r for r in evidence if r.required]
-    factual = [c for c in criteria if c.kind is CheckKind.FACTUAL]
+    factual = counted_factual(criteria)
+    skipped = [c for c in criteria if c.outcome is CheckOutcome.NOT_APPLICABLE]
     components: list[ScoreComponent] = []
 
     ev_max, fc_max = WEIGHT_EVIDENCE, WEIGHT_FACTUAL
     ev_note = fc_note = ""
     if required and not factual:
         ev_max, fc_max = WEIGHT_EVIDENCE + WEIGHT_FACTUAL, 0
-        ev_note = f"; {WEIGHT_FACTUAL} points redistributed from factual criteria (none defined)"
+        why = "none supplied" if skipped else "none defined"
+        ev_note = f"; {WEIGHT_FACTUAL} points redistributed from factual criteria ({why})"
     elif factual and not required:
         ev_max, fc_max = 0, WEIGHT_EVIDENCE + WEIGHT_FACTUAL
         fc_note = f"; {WEIGHT_EVIDENCE} points redistributed from required evidence (none defined)"
     elif not required and not factual:
         ev_max = fc_max = 0
+    if skipped:
+        fc_note += "; optional not supplied and not counted: " + ", ".join(c.criterion_id for c in skipped)
 
     if required:
         earned = sum(_evidence_credit(r) for r in required) / len(required) * ev_max
@@ -396,8 +413,11 @@ def score(evidence: list[EvidenceResult], criteria: list[CriterionResult], deliv
             reason=f"{len(passed)} of {len(factual)} factual criteria pass ({fc_max}/{len(factual)} each){fc_note}",
         ))
     else:
-        components.append(ScoreComponent(name="factual_criteria", points=0, max_points=0,
-                                         reason="no factual criteria defined on the contract"))
+        components.append(ScoreComponent(
+            name="factual_criteria", points=0, max_points=0,
+            reason=("no factual criteria defined on the contract" if not skipped else
+                    "no factual criteria to count" + fc_note),
+        ))
 
     by_name = {d.name: d for d in deliverables}
     half = WEIGHT_DELIVERABLES // 2
@@ -519,13 +539,16 @@ def _summary(
 ) -> str:
     required = [r for r in evidence if r.required]
     found = sum(1 for r in required if r.outcome is not EvidenceOutcome.MISSING)
-    factual = [c for c in criteria if c.kind is CheckKind.FACTUAL]
+    factual = counted_factual(criteria)
     passed = sum(1 for c in factual if c.outcome is CheckOutcome.PASS)
+    skipped = [c for c in criteria if c.outcome is CheckOutcome.NOT_APPLICABLE]
     parts = [f"Score {total}/100, {recommendation.value}: {why}."]
     if required:
         parts.append(f"Required evidence {found}/{len(required)} found.")
     if factual:
         parts.append(f"Factual criteria {passed}/{len(factual)} pass.")
+    if skipped:
+        parts.append(f"Optional not supplied: {', '.join(c.criterion_id for c in skipped)}.")
     if judgment:
         parts.append(f"{len(judgment)} criteria still need your judgment; the score does not cover them.")
     warnings = [f.code for f in flags if f.severity is not Severity.INFO]

@@ -637,7 +637,7 @@ def status() -> None:
 
 # -- review scorecards ------------------------------------------------------------
 
-_MARK = {"pass": "+", "fail": "x", "needs_human": "?", "blocked": "!",
+_MARK = {"pass": "+", "fail": "x", "needs_human": "?", "blocked": "!", "not_applicable": "-",
          "found": "+", "found_unverified_type": "~", "found_constraint_failed": "~", "missing": "x"}
 
 

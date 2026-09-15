@@ -27,6 +27,7 @@ from humanfallback.models import (
     TaskContract,
 )
 from humanfallback.review import review_submission
+from test_review_extract import LIVE_INLINE_HTML, INLINE_IMG
 from humanfallback.review.rules import (
     ACCEPTABLE_SCORE,
     REJECT_SCORE,
@@ -35,6 +36,7 @@ from humanfallback.review.rules import (
     WEIGHT_DELIVERABLES,
     WEIGHT_EVIDENCE,
     WEIGHT_FACTUAL,
+    recommend,
 )
 
 NOW = datetime(2026, 9, 12, tzinfo=UTC)
@@ -326,9 +328,7 @@ class TestRecommendationOrder:
     def test_thresholds_are_consistent(self) -> None:
         assert REJECT_SCORE < ACCEPTABLE_SCORE < STRONG_SCORE <= 100
 
-    def test_acceptable_band(self) -> None:
-        # Two required urls + two factual criteria; supply one url -> ev 25/50, one criterion passes 15/30, deliverables 20 => 60 -> incomplete.
-        # Use optional second url instead so nothing required is missing, and make one factual criterion fail on its own.
+    def test_absent_optional_criterion_does_not_cost_the_strong_band(self) -> None:
         contract = _custom(
             [EvidenceRequirement(id="ev-1", kind=EvidenceKind.URL, description="u")],
             [
@@ -337,8 +337,18 @@ class TestRecommendationOrder:
             ],
         )
         r = review_submission(contract, _sub(f"posted {POST}"))
-        assert r.score == 85  # 50 + 15 + 20
-        assert r.recommendation is Recommendation.ACCEPTABLE
+        assert r.score == 100
+        assert r.recommendation is Recommendation.STRONG
+        assert r.acceptance_results[1].outcome is CheckOutcome.NOT_APPLICABLE
+
+    def test_acceptable_band(self) -> None:
+        # The band itself, independent of how a score gets there.
+        rec, why = recommend(ACCEPTABLE_SCORE, [], [], [])
+        assert rec is Recommendation.ACCEPTABLE and "mostly pass" in why
+        rec, _ = recommend(STRONG_SCORE - 1, [], [], [])
+        assert rec is Recommendation.ACCEPTABLE
+        rec, _ = recommend(STRONG_SCORE, [], [], [])
+        assert rec is Recommendation.STRONG
 
     def test_incomplete_beats_thresholds(self) -> None:
         contract = _custom(
@@ -368,3 +378,211 @@ class TestRecommendationOrder:
         a = review_submission(contract, sub, now=NOW)
         b = review_submission(contract, sub, now=NOW)
         assert a == b
+
+
+# -- optional criteria: skipped when not supplied, judged when supplied -----------
+
+
+def _optional_contract() -> TaskContract:
+    return _custom(
+        [
+            EvidenceRequirement(id="ev-1", kind=EvidenceKind.SCREENSHOT, description="terminal screenshot"),
+            EvidenceRequirement(id="ev-2", kind=EvidenceKind.TEXT, description="output and feedback", constraints={"min_words": "60"}),
+            EvidenceRequirement(id="ev-3", kind=EvidenceKind.URL, description="optional link", required=False),
+        ],
+        [
+            AcceptanceCriterion(id="ac-1", statement="fulfils request", evidence_ids=["ev-1", "ev-2"]),
+            AcceptanceCriterion(id="ac-2", statement="screenshot attached", check_type=CheckType.EVIDENCE_PRESENT, evidence_ids=["ev-1"]),
+            AcceptanceCriterion(id="ac-3", statement="ver line", check_type=CheckType.PATTERN, expected=r"Microsoft Windows \[Version [\d.]+\]", evidence_ids=["ev-2"]),
+            AcceptanceCriterion(id="ac-4", statement="hf version", check_type=CheckType.PATTERN, expected=r"humanfallback\s+0\.4\.0", evidence_ids=["ev-2"]),
+            AcceptanceCriterion(id="ac-5", statement="classify category", check_type=CheckType.PATTERN, expected=r"category:\s*physical_action", evidence_ids=["ev-2"]),
+            AcceptanceCriterion(id="ac-6", statement="feedback is concrete", evidence_ids=["ev-2"]),
+            AcceptanceCriterion(id="ac-7", statement="optional pytest line", check_type=CheckType.PATTERN, expected=r"\d+ passed", required=False, evidence_ids=["ev-2"]),
+            AcceptanceCriterion(id="ac-8", statement="optional link present", check_type=CheckType.EVIDENCE_PRESENT, required=False, evidence_ids=["ev-3"]),
+            AcceptanceCriterion(id="ac-9", statement="optional link is relevant", required=False, evidence_ids=["ev-3"]),
+        ],
+        title="Verify HumanFallback setup instructions on Windows",
+        description="Verify the setup instructions on Windows and give your human feedback.",
+    )
+
+
+def _outcome(review, cid: str) -> CheckOutcome:  # noqa: ANN001
+    return next(c.outcome for c in review.acceptance_results if c.criterion_id == cid)
+
+
+# Sanitised shapes of the four submissions received on the stage bounty
+# (2026-09-15). None carried media; none contained the
+# `hf --version` or classify output the contract asked for.
+LIVE_SHORT = "<p>worked fine on windows. installation was easy and the classification command ran successfully. nothing was confusing.</p>"
+LIVE_VER_ONLY = (
+    "<p>Windows version:</p><pre><code>Microsoft Windows [Version 10.0.22631.4169]</code></pre>"
+    "<p><code>uv run hf --version</code>:</p><pre><code>&lt;sample version output&gt;</code></pre>"
+    "<p><code>uv run hf classify ...</code>:</p><pre><code>&lt;sample classify output&gt;</code></pre>"
+    "<p>Feedback: " + " ".join(["word"] * 70) + "</p>"
+)
+LIVE_WRONG_VERSION_WITH_PYTEST = (
+    "<p>windowsVersion: Microsoft Windows [Version 10.0.26100.6584]</p>"
+    "<p>versionOutput: HumanFallback 0.1.0</p><p>classifyOutput: human_required: True category: physical</p>"
+    "<p>pytestOutput: 48 passed in 12.3s</p><p>feedback: " + " ".join(["word"] * 100) + "</p>"
+)
+LIVE_MACOS = (
+    "<p>I tested this on macOS rather than Windows. uv sync and both HumanFallback commands worked correctly. "
+    "The instructions were generally clear, but including prerequisites for Git and Python would help new users.</p>"
+)
+
+
+class TestOptionalCriteria:
+    def test_absent_optional_pattern_is_not_applicable(self) -> None:
+        r = review_submission(_optional_contract(), _sub(LIVE_VER_ONLY))
+        c = next(c for c in r.acceptance_results if c.criterion_id == "ac-7")
+        assert c.outcome is CheckOutcome.NOT_APPLICABLE
+        assert c.kind is CheckKind.FACTUAL
+        assert "optional and not supplied" in c.detail and "not counted" in c.detail
+
+    def test_absent_optional_criteria_are_not_missing_requirements(self) -> None:
+        r = review_submission(_optional_contract(), _sub(LIVE_VER_ONLY))
+        ids = {m.id for m in r.missing_requirements}
+        assert {"ac-7", "ac-8", "ac-9"}.isdisjoint(ids)
+        # Optional evidence is still listed, informationally, as not required.
+        assert [m.required for m in r.missing_requirements if m.id == "ev-3"] == [False]
+        # Required shortfalls are still reported.
+        assert {"ev-1", "ac-2", "ac-4", "ac-5"} <= ids
+
+    def test_absent_optional_criteria_leave_the_denominator(self) -> None:
+        r = review_submission(_optional_contract(), _sub(LIVE_VER_ONLY))
+        fc = next(c for c in r.score_breakdown if c.name == "factual_criteria")
+        # ac-2..ac-5 counted (1 passes); ac-7 and ac-8 skipped.
+        assert (fc.points, fc.max_points) == (8, WEIGHT_FACTUAL)
+        assert "1 of 4 factual criteria pass" in fc.reason
+        assert "not counted: ac-7, ac-8" in fc.reason
+        assert "Optional not supplied: ac-7, ac-8, ac-9." in r.summary
+        assert "Factual criteria 1/4 pass." in r.summary
+
+    def test_absent_optional_cannot_make_incomplete(self) -> None:
+        contract = _custom(
+            [EvidenceRequirement(id="ev-1", kind=EvidenceKind.URL, description="u")],
+            [
+                AcceptanceCriterion(id="ac-1", statement="present", check_type=CheckType.EVIDENCE_PRESENT, evidence_ids=["ev-1"]),
+                AcceptanceCriterion(id="ac-2", statement="opt", check_type=CheckType.PATTERN, expected="never-there", required=False),
+                AcceptanceCriterion(id="ac-3", statement="opt manual", required=False, evidence_ids=[]),
+            ],
+        )
+        r = review_submission(contract, _sub(f"posted {POST}"))
+        assert r.recommendation is Recommendation.STRONG
+        assert r.score == 100
+        assert not r.missing_requirements
+        assert _outcome(r, "ac-2") is CheckOutcome.NOT_APPLICABLE
+        assert _outcome(r, "ac-3") is CheckOutcome.NEEDS_HUMAN  # nothing to block on; still a judgment call
+
+    def test_supplied_optional_inputs_are_judged_normally(self) -> None:
+        r = review_submission(_optional_contract(), _sub(f"{LIVE_WRONG_VERSION_WITH_PYTEST} see {POST}"))
+        assert _outcome(r, "ac-7") is CheckOutcome.PASS  # pytest line supplied and counted
+        assert _outcome(r, "ac-8") is CheckOutcome.PASS  # optional link supplied
+        assert _outcome(r, "ac-9") is CheckOutcome.NEEDS_HUMAN  # evidence present -> a person judges it
+        assert _outcome(r, "ac-4") is CheckOutcome.FAIL  # 0.1.0 is not 0.4.0; required stays strict
+        assert _outcome(r, "ac-5") is CheckOutcome.FAIL
+        fc = next(c for c in r.score_breakdown if c.name == "factual_criteria")
+        assert "3 of 6 factual criteria pass" in fc.reason  # ac-3, ac-7, ac-8
+        assert "not counted" not in fc.reason
+
+    def test_optional_manual_with_missing_evidence_is_skipped_not_blocked(self) -> None:
+        r = review_submission(_optional_contract(), _sub(LIVE_VER_ONLY))
+        assert _outcome(r, "ac-9") is CheckOutcome.NOT_APPLICABLE
+        assert _outcome(r, "ac-1") is CheckOutcome.BLOCKED  # required manual still blocked on ev-1
+
+    def test_all_factual_optional_and_absent_redistributes_with_reason(self) -> None:
+        contract = _custom(
+            [EvidenceRequirement(id="ev-1", kind=EvidenceKind.URL, description="u")],
+            [AcceptanceCriterion(id="ac-1", statement="opt", check_type=CheckType.PATTERN, expected="zzz", required=False)],
+        )
+        r = review_submission(contract, _sub(f"posted {POST}"))
+        scores = _score_of(r)
+        assert scores["required_evidence"] == (WEIGHT_EVIDENCE + WEIGHT_FACTUAL, WEIGHT_EVIDENCE + WEIGHT_FACTUAL)
+        assert scores["factual_criteria"] == (0, 0)
+        ev = next(c for c in r.score_breakdown if c.name == "required_evidence")
+        assert "redistributed from factual criteria (none supplied)" in ev.reason
+        fc = next(c for c in r.score_breakdown if c.name == "factual_criteria")
+        assert "no factual criteria to count" in fc.reason and "ac-1" in fc.reason
+        assert not any(f.code == "SUBJECTIVE_ONLY" for f in r.flags)
+
+    @pytest.mark.parametrize(
+        ("content", "score", "missing"),
+        [
+            (LIVE_SHORT, 32, {"ev-1", "ac-1", "ac-2", "ac-3", "ac-4", "ac-5", "required_evidence_supplied", "constraints_satisfied"}),
+            (LIVE_VER_ONLY, 53, {"ev-1", "ac-1", "ac-2", "ac-4", "ac-5", "required_evidence_supplied"}),
+            (LIVE_WRONG_VERSION_WITH_PYTEST, 57, {"ev-1", "ac-1", "ac-2", "ac-4", "ac-5", "required_evidence_supplied"}),
+            (LIVE_MACOS, 32, {"ev-1", "ac-1", "ac-2", "ac-3", "ac-4", "ac-5", "required_evidence_supplied", "constraints_satisfied"}),
+        ],
+    )
+    def test_m5_live_shapes(self, content: str, score: int, missing: set[str]) -> None:
+        contract = _optional_contract()
+        contract.acceptance_criteria = contract.acceptance_criteria[:7]  # the live contract had ac-1..ac-7
+        contract.evidence_requirements = contract.evidence_requirements[:2]
+        r = review_submission(contract, _sub(content))
+        assert r.score == score
+        assert r.recommendation is Recommendation.INCOMPLETE
+        assert {m.id for m in r.missing_requirements} == missing
+        assert _outcome(r, "ac-2") is CheckOutcome.FAIL  # no media on any live submission
+
+
+class TestInlineScreenshot:
+    """Live M5 case: screenshot pasted as <img> in content, media empty."""
+
+    def _contract(self) -> TaskContract:
+        contract = _optional_contract()
+        contract.acceptance_criteria = contract.acceptance_criteria[:7]
+        contract.evidence_requirements = contract.evidence_requirements[:2]
+        return contract
+
+    def test_inline_img_satisfies_screenshot_requirement(self) -> None:
+        r = review_submission(self._contract(), _sub(LIVE_INLINE_HTML))
+        ev = {e.evidence_id: e for e in r.evidence_results}
+        assert ev["ev-1"].outcome is EvidenceOutcome.FOUND
+        assert ev["ev-1"].matched == [INLINE_IMG]
+        assert "inline <img> in content" in ev["ev-1"].detail
+        assert ev["ev-2"].outcome is EvidenceOutcome.FOUND
+        assert {c: _outcome(r, c) for c in ("ac-2", "ac-3", "ac-4", "ac-5")} == {c: CheckOutcome.PASS for c in ("ac-2", "ac-3", "ac-4", "ac-5")}
+        assert _outcome(r, "ac-7") is CheckOutcome.NOT_APPLICABLE
+        assert _outcome(r, "ac-1") is CheckOutcome.NEEDS_HUMAN
+        assert _outcome(r, "ac-6") is CheckOutcome.NEEDS_HUMAN
+        assert r.human_judgment_required
+        assert not r.missing_requirements
+        assert r.score == 100
+        assert r.recommendation is Recommendation.STRONG
+        assert not r.has_flag("UNVERIFIED_EVIDENCE_TYPE")
+
+    def test_saying_screenshot_attached_is_not_a_screenshot(self) -> None:
+        text = LIVE_INLINE_HTML.replace(f'<img src="{INLINE_IMG}" alt="Image" />', "<p>screenshot attached below</p>")
+        r = review_submission(self._contract(), _sub(text))
+        assert next(e for e in r.evidence_results if e.evidence_id == "ev-1").outcome is EvidenceOutcome.MISSING
+        assert _outcome(r, "ac-2") is CheckOutcome.FAIL
+        assert r.recommendation is Recommendation.INCOMPLETE
+
+    def test_plain_url_in_prose_is_not_a_screenshot(self) -> None:
+        text = LIVE_INLINE_HTML.replace(f'<img src="{INLINE_IMG}" alt="Image" />', "<p>proof: https://x.com/me/status/9</p>")
+        r = review_submission(self._contract(), _sub(text))
+        assert next(e for e in r.evidence_results if e.evidence_id == "ev-1").outcome is EvidenceOutcome.MISSING
+        assert _outcome(r, "ac-2") is CheckOutcome.FAIL
+
+    def test_inline_photo_kind_also_satisfied(self) -> None:
+        contract = self._contract()
+        contract.evidence_requirements[0].kind = EvidenceKind.PHOTO
+        r = review_submission(contract, _sub(LIVE_INLINE_HTML))
+        assert next(e for e in r.evidence_results if e.evidence_id == "ev-1").outcome is EvidenceOutcome.FOUND
+
+    def test_live_submission_ranks_first(self) -> None:
+        from humanfallback.review import compare_reviews
+
+        contract = self._contract()
+        subs = [
+            _sub(LIVE_SHORT, sid="short"),
+            _sub(LIVE_VER_ONLY, sid="ver"),
+            _sub(LIVE_WRONG_VERSION_WITH_PYTEST, sid="wrong"),
+            _sub(LIVE_MACOS, sid="mac"),
+            _sub(LIVE_INLINE_HTML, sid="inline"),
+        ]
+        reviews = [review_submission(contract, s) for s in subs]
+        cmp = compare_reviews(contract.id, reviews, subs)
+        assert cmp.strongest_submission_id == "inline"
+        assert [r.submission_id for r in cmp.ranked_reviews][:2] == ["inline", "wrong"]
+        assert cmp.ranked_reviews[0].score == 100 and cmp.ranked_reviews[1].score == 57

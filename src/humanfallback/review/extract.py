@@ -1,8 +1,9 @@
-"""Pull verifiable evidence out of a submission: URLs, media, transaction
-signatures, and the prose body. Purely syntactic."""
+"""Pull verifiable evidence out of a submission: URLs, inline images, media,
+transaction signatures, and the prose body. Purely syntactic."""
 
 from __future__ import annotations
 
+import html
 import re
 from dataclasses import dataclass, field
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -14,6 +15,10 @@ from .text import strip_html, word_count
 ItemKind = str  # url | image | document | media | transaction | unknown
 
 _URL_RE = re.compile(r"""https?://[^\s<>"'\)\]]+""", re.IGNORECASE)
+# An <img> element the worker embedded in the content. Gibwork's editor
+# emits these for pasted screenshots without listing them under media.
+_IMG_SRC_RE = re.compile(r"""<img\b[^>]*?\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.IGNORECASE)
+_DATA_URI_PREVIEW = 48
 _TRAILING_PUNCT = ".,;:!?)\"'"
 _SIGNATURE_RE = re.compile(r"(?<![1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{87,88}(?![1-9A-HJ-NP-Za-km-z])")
 
@@ -30,7 +35,7 @@ class EvidenceItem:
     value: str
     normalized: str
     kind: ItemKind
-    source: str  # content | media
+    source: str  # content | inline_image | media
     extension: str | None = None
 
     @property
@@ -92,9 +97,29 @@ def classify_url(value: str) -> tuple[ItemKind, str | None]:
     return "url", None
 
 
+def inline_images(content: str) -> list[EvidenceItem]:
+    """Every <img src> in the HTML content, as image evidence. The element
+    itself says it is an image, so no extension is needed; a data: URI is
+    kept but shown truncated."""
+    items: list[EvidenceItem] = []
+    for match in _IMG_SRC_RE.finditer(content or ""):
+        src = html.unescape(match.group(1) or match.group(2) or "").strip()
+        if not src:
+            continue
+        if src.lower().startswith("data:"):
+            mime = src[5:].split(";", 1)[0].split(",", 1)[0]  # data:image/png;base64,...
+            ext = mime.split("/", 1)[1].lower() if "/" in mime else None
+            items.append(EvidenceItem(src[:_DATA_URI_PREVIEW] + "...", src, "image", "inline_image", ext))
+            continue
+        normalized = normalize_url(src) if "://" in src else src
+        items.append(EvidenceItem(src, normalized, "image", "inline_image", _extension(src)))
+    return items
+
+
 def extract(submission: RemoteSubmission) -> Extracted:
+    raw_items: list[EvidenceItem] = inline_images(submission.content)
+    inline = {item.normalized for item in raw_items}
     text = strip_html(submission.content)
-    raw_items: list[EvidenceItem] = []
 
     def strip_trailing(u: str) -> str:
         return u.rstrip(_TRAILING_PUNCT)
@@ -123,6 +148,10 @@ def extract(submission: RemoteSubmission) -> Extracted:
             normalized = value
         if kind == "unknown":
             unsupported.append(value)
+        if normalized in inline:
+            # The same file shown inline and listed under media is one
+            # artifact, not a repeated reference.
+            continue
         raw_items.append(EvidenceItem(value, normalized, kind, "media", ext))
 
     seen: dict[str, int] = {}

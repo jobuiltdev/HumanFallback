@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from humanfallback.models import RemoteSubmission
 from humanfallback.review import extract
-from humanfallback.review.extract import classify_media, classify_url, normalize_url
+from humanfallback.review.extract import classify_media, classify_url, inline_images, normalize_url
 from humanfallback.review.text import contract_terms, overlap, stem, strip_html, tokenize, word_count
 
 SIG = "5VfYmGB7qXhQ" + "1" * 76  # 88 base58 characters
@@ -83,3 +83,71 @@ class TestExtract:
     def test_empty(self) -> None:
         ex = extract(_sub(""))
         assert ex.items == [] and ex.word_count == 0 and ex.duplicates == {}
+
+
+# Sanitised copy of the HTML structure of a live stage submission
+# (2026-09-15): the pasted screenshot arrives as an <img> inside
+# the content while the media list is empty.
+INLINE_IMG = "https://media.example.net/attachments/1111/2222/IMG_6608.jpg?ex=abc&is=def&hm=0123&=&format=webp&width=1200&height=600"
+LIVE_INLINE_HTML = (
+    "<p>Windows version: Microsoft Windows [Version 10.0.22631.4169]<br /><br /> uv run hf --version: humanfallback 0.4.0"
+    "<br /><br />uv run hf classify \"Go to the hardware store and take a photo of the shelf\": <br />human_required: True "
+    "<br />category: physical_action<br />confidence: 0.95 reasons: </p><ul><li><p>requires physical presence</p></li>"
+    "<li><p>requires taking a photo of something real</p></li></ul>"
+    f"<img src=\"{INLINE_IMG}\" alt=\"Image\" />"
+    "<p><br /><br />Feedback: <br />The setup process was straightforward on Windows and the commands were easy to follow "
+    "in the order provided. One improvement would be to make the prerequisites more explicit before the setup steps, "
+    "especially that Git, Python, and uv should already be installed. It would also help new users if the instructions "
+    "included a short example of the expected command output so they can confirm that everything is working.</p>"
+)
+
+
+class TestInlineImages:
+    def test_live_html_yields_one_image_item(self) -> None:
+        ex = extract(_sub(LIVE_INLINE_HTML))
+        assert [(i.kind, i.source, i.extension) for i in ex.items] == [("image", "inline_image", "jpg")]
+        assert ex.items[0].value == INLINE_IMG
+        assert ex.items[0].normalized == normalize_url(INLINE_IMG)
+        assert "IMG_6608" not in ex.body  # the tag is gone from the prose
+        assert ex.word_count > 60
+        assert ex.duplicates == {} and ex.unsupported == []
+
+    def test_img_without_extension_is_still_an_image(self) -> None:
+        ex = extract(_sub('<p>see</p><img src="https://cdn.example/media/abc123" />'))
+        assert [(i.kind, i.extension) for i in ex.items] == [("image", None)]
+
+    def test_single_quotes_entities_and_attribute_order(self) -> None:
+        ex = extract(_sub("<IMG alt='x' SRC='https://cdn.example/a.png?a=1&amp;b=2'>"))
+        assert ex.items[0].value == "https://cdn.example/a.png?a=1&b=2"
+        assert ex.items[0].kind == "image"
+
+    def test_data_uri_is_kept_but_truncated(self) -> None:
+        payload = "data:image/png;base64," + "A" * 400
+        ex = extract(_sub(f'<img src="{payload}">'))
+        assert ex.items[0].kind == "image" and ex.items[0].extension == "png"
+        assert ex.items[0].value.endswith("...") and len(ex.items[0].value) < 60
+        assert ex.items[0].normalized == payload
+
+    def test_empty_src_ignored(self) -> None:
+        assert inline_images('<img src="" /><img alt="no src">') == []
+        assert extract(_sub('<img src="">')).items == []
+
+    def test_same_file_inline_and_in_media_is_one_artifact(self) -> None:
+        ex = extract(_sub(f'<img src="{INLINE_IMG}">', [INLINE_IMG]))
+        assert len(ex.items) == 1
+        assert ex.items[0].source == "inline_image"
+        assert ex.duplicates == {}  # not a repeated reference
+
+    def test_separate_media_still_extracted(self) -> None:
+        ex = extract(_sub(f'<img src="{INLINE_IMG}">', ["https://cdn.gib.work/media/other.png", "mediaid"]))
+        assert [(i.kind, i.source) for i in ex.items] == [("image", "inline_image"), ("image", "media"), ("media", "media")]
+
+    def test_img_url_repeated_as_plain_text_is_a_duplicate(self) -> None:
+        ex = extract(_sub(f'<img src="{INLINE_IMG}"><p>also {INLINE_IMG}</p>'))
+        assert len(ex.items) == 1
+        assert ex.duplicates == {normalize_url(INLINE_IMG): 2}
+
+    def test_prose_and_plain_urls_do_not_become_images(self) -> None:
+        ex = extract(_sub("<p>screenshot attached, see https://x.com/me/status/9 and https://cdn.example/a.jpg</p>"))
+        assert [(i.kind, i.source) for i in ex.items] == [("url", "content"), ("image", "content")]
+        assert not [i for i in ex.items if i.source == "inline_image"]
