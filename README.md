@@ -9,11 +9,14 @@ taste. HumanFallback detects those tasks, converts them into structured
 **Task Contracts** with explicit acceptance criteria and evidence
 requirements, and delegates them to people through Gibwork bounties.
 
-## Status: Milestone 4
+## Status: Milestone 5
 
 M1 delivered the local foundation, M2 the real Gibwork integration, M3
 the MCP server for agents, and M4 a deterministic review layer that
-scores submissions against the Task Contract. The default backend is
+scores submissions against the Task Contract. M5 validated the whole
+pipeline on Gibwork stage with real USDC: one bounty, five real
+submissions, reviews ranked as a human would, two review defects fixed,
+escrow refunded (see `docs/m5/README.md`). The default backend is
 still the mock, and nothing reaches Gibwork unless you select the
 `gibwork` adapter. No path, CLI or MCP, moves money without a person
 approving a quote in a terminal, and nothing approves or rejects a
